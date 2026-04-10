@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Model files
+*.pt
+*.pth
+
+# Results and outputs
+results/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Third-party reference repos
+futureprojex/
+
+# Professor examples
+halit hoca/
+
+# LaTeX build artifacts
+teknik_dokuman/
+
+# PDF outputs (keep source, not binaries)
+SPINE_KISA_RAPOR.pdf
+
+# Images in tests
+tests/*.png
+
+# Claude Code config
+CLAUDE.md
+tests/CLAUDE.md
