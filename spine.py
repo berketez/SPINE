@@ -40,7 +40,7 @@ from torch.fft import fft2, ifft2, fftfreq
 import math
 import os
 import warnings
-from typing import Optional, Tuple, Dict, List, Union
+from typing import Optional, Tuple, Dict, List, Union, Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -167,6 +167,9 @@ __all__ = [
     'SolidNeuron3D',
     'ShellNeuron3D',
     'BeamNeuron3D',
+
+    # Eksenel Çubuk Nöronu (1D - Faz 5b)
+    'RodNeuron',
 
     # Ana Model Container
     'SPINE',
@@ -2662,6 +2665,267 @@ class BeamNeuron3D(nn.Module):
     
     def extra_repr(self) -> str:
         return f"L={self.L}, EI={self.EI:.2e}"
+
+
+# =============================================================================
+# EKSENEL ÇUBUK NÖRONU (1D Rod / Bar) — Faz 5b
+# =============================================================================
+
+class RodNeuron(nn.Module):
+    r"""
+    Eksenel Çubuk Nöronu (Axial Rod/Bar).
+
+    Yöneten denklem (1D eksenel denge + bünye):
+
+        d/dx [ E·A(x) · du/dx ] + f(x) = 0
+
+    burada:
+        u(x) : eksenel deplasman (m)
+        E(x) : Young modülü (Pa)        — segment/konum bağımlı olabilir
+        A(x) : kesit alanı (m²)         — değişken kesit (koni/taper) destekli
+        f(x) : dağıtılmış eksenel yük (N/m, +x yönü pozitif) — öz-ağırlık dahil
+        N(x) = E·A·du/dx : iç normal kuvvet (çekme +)
+
+    Çözüm stratejisi — mühendis kafasıyla, iki şeffaf adım (FFT YOK):
+        1) STATİK (denge):    dN/dx = -f  →  N(x), uç/ara yüklerden integralle.
+        2) KİNEMATİK (bünye): ε = N/(E·A),  u(x) = ∫ ε dx   (ankastre uçtan).
+
+    1D'de integraller doğrudan kuadratür (trapez) ile alınır; bu hem analitik
+    çözümle bire bir, hem de değişken katsayılı E·A(x) için spektral FFT'nin
+    aksine doğal olarak doğrudur.
+
+    SPINE felsefesi: fizik nöronun *içine* gömülüdür. Tek öğrenilebilir
+    parametre `stiffness_modulator` (EA çarpanı); deterministik modda 1.0,
+    ters/veri-uydurma problemlerinde gradyanla ayarlanabilir.
+
+    Koordinat sözleşmesi: x ∈ [0, L]. `fixed_end='left'` (varsayılan) → x=0
+    ankastre (u=0), x=L serbest uç. Tüm tekil yükler ve dağıtılmış yük çekme
+    (serbest uca doğru) yönünde pozitiftir.
+
+    Args:
+        length: Çubuk boyu L (m).
+        resolution: Grid nokta sayısı (varsayılan 401 — tek sayı Simpson dostu).
+        dtype: torch.float64 (varsayılan, deterministik referans doğruluğu için).
+        device: Hesap cihazı (varsayılan CPU — 1D, küçük, MPS gerekmez).
+    """
+
+    def __init__(self, length: float, resolution: int = 401,
+                 dtype: torch.dtype = torch.float64,
+                 device: Optional[torch.device] = None):
+        super().__init__()
+        self.L = float(length)
+        self.resolution = int(resolution)
+        self.dtype = dtype
+        self._device = device if device is not None else torch.device("cpu")
+
+        x = torch.linspace(0.0, self.L, self.resolution,
+                           dtype=dtype, device=self._device)
+        self.register_buffer("x", x)
+
+        # Tek öğrenilebilir parametre — EA çarpanı (SPINE modulator paterni)
+        self.stiffness_modulator = nn.Parameter(
+            torch.ones(1, dtype=dtype, device=self._device)
+        )
+
+    # ------------------------------------------------------------------ utils
+    def _resolve_field(self, spec: Union[float, int, Callable, torch.Tensor],
+                       name: str) -> torch.Tensor:
+        """float | callable(x) | tensor → x ile aynı boyutta tensör."""
+        x = self.x
+        if callable(spec):
+            field = spec(x)
+            if not isinstance(field, torch.Tensor):
+                field = torch.as_tensor(field, dtype=self.dtype, device=self._device)
+            field = field.to(dtype=self.dtype, device=self._device)
+            if field.shape != x.shape:
+                raise ValueError(
+                    f"RodNeuron: `{name}` callable çıktısı {tuple(field.shape)}, "
+                    f"beklenen {tuple(x.shape)}."
+                )
+            return field
+        if isinstance(spec, torch.Tensor):
+            if spec.shape != x.shape:
+                raise ValueError(
+                    f"RodNeuron: `{name}` tensörü {tuple(spec.shape)}, "
+                    f"beklenen {tuple(x.shape)}."
+                )
+            return spec.to(dtype=self.dtype, device=self._device)
+        return torch.full_like(x, float(spec))
+
+    @staticmethod
+    def _cumtrapz_from_left(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """u(x) = ∫₀ˣ y ds (trapez). Çıktı uzunluğu N, u[0]=0."""
+        dx = x[1:] - x[:-1]
+        seg = 0.5 * (y[1:] + y[:-1]) * dx
+        out = torch.zeros_like(y)
+        out[1:] = torch.cumsum(seg, dim=0)
+        return out
+
+    @staticmethod
+    def _cumtrapz_from_right(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """I(x) = ∫ₓᴸ y ds (trapez). Çıktı uzunluğu N, I[-1]=0."""
+        dx = x[1:] - x[:-1]
+        seg = 0.5 * (y[1:] + y[:-1]) * dx
+        out = torch.zeros_like(y)
+        out[:-1] = torch.flip(torch.cumsum(torch.flip(seg, [0]), dim=0), [0])
+        return out
+
+    # ------------------------------------------------------------------ solve
+    def solve(self,
+              E: Union[float, Callable, torch.Tensor],
+              A: Union[float, Callable, torch.Tensor],
+              distributed_load: Union[float, Callable, torch.Tensor] = 0.0,
+              point_loads: Optional[List[Tuple[float, float]]] = None,
+              fixed_end: str = "left",
+              rho: Optional[Union[float, Callable, torch.Tensor]] = None,
+              g: float = 9.81,
+              self_weight: bool = False,
+              explain: bool = False,
+              label: str = "") -> Dict[str, torch.Tensor]:
+        r"""
+        Eksenel çubuğu çöz.
+
+        Args:
+            E: Young modülü alanı — float | callable(x) | tensör[N].
+            A: Kesit alanı alanı  — float | callable(x) | tensör[N].
+            distributed_load: f(x) dağıtılmış eksenel yük [N/m], +x (serbest uca
+                doğru) pozitif. Öz-ağırlık DIŞI yükler için.
+            point_loads: [(x_i, P_i), ...] tekil eksenel yükler; P_i çekme
+                (serbest uca doğru) pozitif. Uç yükü de buraya konur (x_i=L).
+            fixed_end: 'left' (x=0 ankastre, varsayılan) veya 'right'.
+            rho: yoğunluk (kg/m³) — `self_weight=True` ise öz-ağırlık için.
+            g: yerçekimi ivmesi (m/s², varsayılan 9.81).
+            self_weight: True ise f(x) += ρ·g·A(x) (serbest uca doğru, asılı
+                çubuk varsayımı). Alternatif: distributed_load'a γ·A(x) elle ver.
+            explain: True ise her çözüm adımını şeffaf biçimde yazdırır.
+            label: explain çıktısında problemi etiketler.
+
+        Returns:
+            dict: x, N (iç kuvvet), sigma (gerilme), epsilon (şekil değiştirme),
+                  u (deplasman alanı), tip_displacement (serbest uç deplasmanı),
+                  EA (rijitlik alanı).
+        """
+        if fixed_end not in ("left", "right"):
+            raise ValueError("fixed_end 'left' veya 'right' olmalı.")
+        x = self.x
+        mod = self.stiffness_modulator
+        eps_pos = 1e-9 * self.L  # tekil yük konum toleransı
+
+        E_field = self._resolve_field(E, "E")
+        A_field = self._resolve_field(A, "A")
+        f_field = self._resolve_field(distributed_load, "distributed_load")
+
+        # Öz-ağırlık: ρ·g·A, serbest uca doğru (asılı çubuk)
+        sw_field = None
+        if self_weight:
+            if rho is None:
+                raise ValueError("self_weight=True ise `rho` verilmeli.")
+            rho_field = self._resolve_field(rho, "rho")
+            sw_field = rho_field * g * A_field  # [N/m], büyüklük
+            # Serbest uca doğru işaret: fixed=left → +x; fixed=right → -x
+            sw_signed = sw_field if fixed_end == "left" else -sw_field
+            f_field = f_field + sw_signed
+
+        EA = E_field * A_field * mod  # rijitlik alanı [N]
+
+        # --- 1) STATİK: N(x), dN/dx = -f ---
+        if fixed_end == "left":   # serbest uç sağda (x=L)
+            N = self._cumtrapz_from_right(f_field, x)          # ∫ₓᴸ f ds
+            if point_loads:
+                for xi, Pi in point_loads:
+                    N = N + float(Pi) * (x <= (float(xi) + eps_pos)).to(self.dtype)
+        else:                     # serbest uç solda (x=0)
+            N = -self._cumtrapz_from_left(f_field, x)          # -∫₀ˣ f ds
+            if point_loads:
+                for xi, Pi in point_loads:
+                    N = N + float(Pi) * (x >= (float(xi) - eps_pos)).to(self.dtype)
+
+        # --- 2) KİNEMATİK: ε = N/(EA), u = ∫ ε dx ---
+        # Sivri uç (koni tepesi) A→0 iken N→0; oranın fiziksel limiti sonludur
+        # ama 0/0 sayısal NaN verir. A=0 düğümlerinde σ=ε=0 (limit) alınır.
+        A_safe = torch.where(A_field.abs() > 0, A_field, torch.ones_like(A_field))
+        EA_safe = torch.where(EA.abs() > 0, EA, torch.ones_like(EA))
+        sigma = torch.where(A_field.abs() > 0, N / A_safe, torch.zeros_like(N))
+        epsilon = torch.where(EA.abs() > 0, N / EA_safe, torch.zeros_like(N))
+        if fixed_end == "left":
+            u = self._cumtrapz_from_left(epsilon, x)   # u(0)=0
+            tip_index = -1
+        else:
+            u = -self._cumtrapz_from_right(epsilon, x)  # u(L)=0
+            tip_index = 0
+
+        tip = u[tip_index]
+
+        if explain:
+            self._explain(label, fixed_end, E_field, A_field, f_field,
+                          point_loads, sw_field, N, sigma, epsilon, u, tip)
+
+        return {
+            "x": x,
+            "N": N,
+            "sigma": sigma,
+            "epsilon": epsilon,
+            "u": u,
+            "tip_displacement": tip,
+            "EA": EA,
+        }
+
+    def _explain(self, label, fixed_end, E_field, A_field, f_field,
+                 point_loads, sw_field, N, sigma, epsilon, u, tip):
+        """Çözümü adım adım, şeffaf biçimde yazdır (hocanın istediği mod)."""
+        sep = "=" * 68
+        title = f" RodNeuron — Adım Adım Eksenel Çözüm "
+        if label:
+            title += f"[{label}] "
+        print(f"\n{sep}\n{title}\n{sep}")
+
+        # 0) Kurulum
+        free = "x=L (sağ)" if fixed_end == "left" else "x=0 (sol)"
+        fix = "x=0 (sol)" if fixed_end == "left" else "x=L (sağ)"
+        print(f"[0] KURULUM")
+        print(f"    Boy L = {self.L:.4g} m, grid = {self.resolution} nokta")
+        print(f"    Ankastre uç: {fix}   |   Serbest uç: {free}")
+        E0, EL = E_field[0].item(), E_field[-1].item()
+        A0, AL = A_field[0].item(), A_field[-1].item()
+        if abs(E0 - EL) / max(abs(E0), 1e-30) < 1e-9:
+            print(f"    E = {E0:.4g} Pa (sabit)")
+        else:
+            print(f"    E(x): {E0:.4g} → {EL:.4g} Pa (konum bağımlı)")
+        if abs(A0 - AL) / max(abs(A0), 1e-30) < 1e-9:
+            print(f"    A = {A0:.6g} m² (sabit kesit)")
+        else:
+            print(f"    A(x): {A0:.6g} → {AL:.6g} m² (değişken kesit)")
+        if sw_field is not None:
+            W = self._cumtrapz_from_left(sw_field, self.x)[-1].item()
+            print(f"    Öz-ağırlık dahil — toplam ağırlık ≈ {W:.4g} N")
+        if point_loads:
+            pl = ", ".join(f"P({xi:.3g})={Pi:.4g} N" for xi, Pi in point_loads)
+            print(f"    Tekil yükler: {pl}")
+
+        # 1) Statik
+        print(f"[1] STATİK — iç normal kuvvet N(x)   (dN/dx = -f)")
+        print(f"    N(ankastre) = {N[0].item() if fixed_end=='left' else N[-1].item():.6g} N"
+              f"   |   N(serbest) = {N[-1].item() if fixed_end=='left' else N[0].item():.6g} N")
+        print(f"    N aralığı: [{N.min().item():.6g}, {N.max().item():.6g}] N")
+
+        # 2) Bünye
+        print(f"[2] BÜNYE — gerilme ve şekil değiştirme")
+        print(f"    σ = N/A : max |σ| = {sigma.abs().max().item():.6g} Pa")
+        print(f"    ε = σ/E = N/(EA) : max |ε| = {epsilon.abs().max().item():.6g}")
+
+        # 3) Kinematik
+        print(f"[3] KİNEMATİK — u(x) = ∫ ε dx   (ankastre uçtan)")
+        print(f"    u(ankastre) = 0 (sınır koşulu)")
+        print(f"    SONUÇ → serbest uç deplasmanı δ = {tip.item():.6g} m"
+              f"  ({tip.item()*1e3:.6g} mm, {tip.item()*1e6:.6g} µm)")
+        print(sep)
+
+    def forward(self, E, A, **kwargs) -> Dict[str, torch.Tensor]:
+        """nn.Module arayüzü — solve() sarmalayıcısı."""
+        return self.solve(E, A, **kwargs)
+
+    def extra_repr(self) -> str:
+        return f"L={self.L}, N={self.resolution}, dtype={self.dtype}"
 
 
 # =============================================================================
