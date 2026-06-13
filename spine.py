@@ -987,21 +987,27 @@ class StaticNeuron(nn.Module):
     
     def max_stress(self, q: float) -> Tuple[float, float]:
         """
-        Maksimum eğilme gerilmeleri.
-        
-        σ_xx = -Ez·κ_xx / (1-ν²)
-        σ_yy = -Ez·κ_yy / (1-ν²)
+        Maksimum eğilme gerilmeleri (Kirchhoff plate teorisi, tam form).
+
+        σ_xx = -E·z/(1-ν²) · (∂²w/∂x² + ν·∂²w/∂y²)
+        σ_yy = -E·z/(1-ν²) · (∂²w/∂y² + ν·∂²w/∂x²)
+
+        Not: Eğrilik gösteriminde κ_x = -∂²w/∂x², κ_y = -∂²w/∂y² alınır;
+        bu nedenle σ = E·z/(1-ν²) · (κ_x + ν·κ_y) ile aynı formdur ve
+        `bending_moments` Mx = D(κ_x + ν·κ_y) formülüyle tutarlıdır.
         """
         w = self.solve(q)
         w_xx, w_yy, _ = self.spectral_ops.second_derivatives(w)
-        
+
         z_max = self.material.h / 2
         E = self.material.E
         nu = self.material.nu
-        
-        sigma_xx = -E * z_max * w_xx / (1 - nu**2)
-        sigma_yy = -E * z_max * w_yy / (1 - nu**2)
-        
+
+        # Kirchhoff plate stress — ν cross-coupling terimleri dahil
+        prefactor = -E * z_max / (1 - nu**2)
+        sigma_xx = prefactor * (w_xx + nu * w_yy)
+        sigma_yy = prefactor * (w_yy + nu * w_xx)
+
         return sigma_xx.abs().max().item(), sigma_yy.abs().max().item()
     
     def forward(self, q: torch.Tensor) -> torch.Tensor:
@@ -2435,25 +2441,59 @@ class BeamNeuron3D(nn.Module):
         E: Young modülü (Pa)
         I: Atalet momenti (m⁴)
         A: Kesit alanı (m²)
-        kappa: Kayma düzeltme faktörü (dikdörtgen için ~5/6)
+        kappa: Kayma düzeltme faktörü (dikdörtgen için ~5/6, dairesel için ~0.9)
+        nu: Poisson oranı (boyutsuz). `material` verilmediyse zorunludur.
+        material: MaterialProperties — verilirse E ve nu otomatik alınır.
     """
-    
+
     def __init__(self, length: float, resolution: int,
-                 E: float, I: float, A: float, 
-                 rho: float = 7850, kappa: float = 5/6):
+                 E: Optional[float] = None, I: float = 1.0, A: float = 1.0,
+                 rho: float = 7850, kappa: float = 5/6,
+                 nu: Optional[float] = None,
+                 material: Optional[MaterialProperties] = None):
         super().__init__()
-        
+
+        # Malzemeyi çözümle: material > (E, nu) > hata
+        if material is not None:
+            self.E = material.E
+            self.nu = material.nu
+        else:
+            if E is None:
+                raise ValueError(
+                    "BeamNeuron3D: ya `material` ya da `E` verilmeli."
+                )
+            self.E = E
+            if nu is None:
+                # Geri-uyumluluk: eski API nu vermiyordu. Çelik varsayımı,
+                # ama uyarı bas (kayma rijitliği yanlış olabilir).
+                warnings.warn(
+                    "BeamNeuron3D: `nu` verilmedi, varsayılan 0.3 (çelik) "
+                    "kullanılıyor. Kayma rijitliği κGA bu varsayıma bağlı; "
+                    "hassas hesap için `nu` veya `material` parametresini geç.",
+                    stacklevel=2,
+                )
+                nu = 0.3
+            self.nu = nu
+
         self.L = length
         self.resolution = resolution
-        self.E = E
         self.I = I
         self.A = A
         self.rho = rho
-        self.kappa = kappa
-        
+        self.kappa = kappa  # shear correction factor
+
         # Rijitlikler
-        self.EI = E * I           # Eğilme rijitliği
-        self.GA = E / (2 * (1 + 0.3)) * A  # Kayma rijitliği (nu=0.3 varsayım)
+        self.EI = self.E * I                          # Eğilme rijitliği [N·m²]
+        # Kayma modülü: G = E / [2(1+ν)]
+        self.G = self.E / (2.0 * (1.0 + self.nu))
+        # Timoshenko kayma rijitliği κGA — κ shear correction factor
+        # Standart Timoshenko/MITC formülasyonu: κGA·γ
+        self.shear_stiffness = self.kappa * self.G * A   # κGA [N]
+        # Geri-uyumluluk için aynı değeri `kGA` ve eski isim `GA` ile de tut.
+        # NOT: Eski `self.GA` aslında κ olmadan G·A idi; burada düzeltildi —
+        # eski kodda `self.GA` kullananlar artık κGA değerini görür.
+        self.kGA = self.shear_stiffness
+        self.GA = self.shear_stiffness
         
         # 1D Grid
         x = torch.linspace(0, length, resolution)
@@ -2538,14 +2578,30 @@ class BeamNeuron3D(nn.Module):
         
         return omega / (2 * math.pi)  # Hz
     
-    def critical_buckling_load(self, n: int = 1) -> float:
+    def critical_buckling_load(self, n: int = 1, K: float = 1.0) -> float:
         """
-        Kritik burkulma yükü (Euler burkulma).
-        
-        Pcr = n²π²EI/L²
+        Kritik burkulma yükü (Euler kolon burkulması).
+
+        P_cr = n²·π²·EI / (K·L)²
+
+        Effective length factor (K):
+            - Pinned-pinned (basit mesnetli)        : K = 1.0   (varsayılan)
+            - Fixed-fixed   (iki ucu ankastre)      : K = 0.5
+            - Fixed-free    (cantilever / konsol)   : K = 2.0
+            - Pinned-fixed  (bir ucu basit, biri ankastre): K = 0.7
+
+        Args:
+            n: Burkulma modu (1 = ilk mod, kritik mod).
+            K: Effective length factor. Sınır koşullarına bağlı (yukarı bkz).
+
+        Returns:
+            P_cr [N]: Kritik eksenel basma yükü.
         """
+        if K <= 0:
+            raise ValueError(f"K (effective length factor) > 0 olmalı, alındı: {K}")
         EI = self.EI * self.stiffness_modulator.item()
-        P_cr = n**2 * math.pi**2 * EI / self.L**2
+        L_eff = K * self.L
+        P_cr = n**2 * math.pi**2 * EI / L_eff**2
         return P_cr
     
     def mode_shape(self, n: int = 1) -> torch.Tensor:
