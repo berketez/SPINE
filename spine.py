@@ -173,12 +173,9 @@ __all__ = [
 
     # Ana Model Container
     'SPINE',
-    
-    # Sinir Ağları (~5000 parametre)
-    'SPINENet',
-    'PhysicsBlock',
-    'SpectralEncoder',
-    'MultiScaleSpectral',
+
+    # Sinir ağları (SPINENet, PhysicsBlock, SpectralEncoder, MultiScaleSpectral)
+    # bu modülde tanımlı değildir — benchmarkVelocity.py'den import edilir.
 
     # Yardımcılar
     'DEVICE',
