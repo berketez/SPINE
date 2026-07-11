@@ -18,6 +18,7 @@ Entegrasyon Testleri (6 adet):
 13. Tam Entegrasyon
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -47,9 +48,12 @@ def run_test(name, script):
 
     start_time = time.time()
 
+    # Betikler bu dosyayla aynı dizinde — cwd'den bağımsız çalışsın
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     result = subprocess.run(
-        [sys.executable, script],
-        capture_output=False
+        [sys.executable, os.path.join(script_dir, script)],
+        capture_output=False,
+        cwd=script_dir
     )
 
     elapsed = time.time() - start_time

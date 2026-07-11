@@ -11,9 +11,12 @@ Düzeltilen bug (2026-07-11 denetimi):
       M_xy = D(1-ν)·κ_xy      (κ_xy = -w_xy konvansiyonuyla)
 
 Not: FFT ikinci türevleri linspace(0, L, N) gridinde (N/(N-1))^2 ≈ %3
-ölçek sapması taşır (grid konvansiyonu, ayrı bilinen sorun). Bu yüzden
-bünye denklemi testleri κ üzerinden makine hassasiyetinde, analitik
-karşılaştırma ise merkez noktada (N/(N-1))^2 çarpanı düşülerek yapılır.
+ölçek sapması taşır (grid konvansiyonu, ayrı bilinen sorun). Bu çarpan
+yalnızca TEK m,n modlarının anti-node'unda (merkez) temiz geçerlidir;
+çift modlarda merkez düğüme yakın olduğundan ve kenar şeritlerinde
+(periyodik olmayan sinyal → Gibbs) genellenemez. Testler bu yüzden
+m=n=1 merkez noktası + iç bölgeyle sınırlıdır; bünye denklemi testleri
+ise κ üzerinden makine hassasiyetindedir.
 
 Çalıştırma:
     PYTHONPATH=. python3 tests/test_plate_moments.py
@@ -122,7 +125,24 @@ def test_strain_energy_reconstruction():
 
     U = state.strain_energy(D, nu)
     assert U.item() > 0, "şekil değiştirme enerjisi pozitif olmalı"
-    print(f"[Enerji] ∇²w geri kazanım oranı {ratio:.4f}, U={U.item():.4e} J — OK")
+
+    # strain_energy İÇ formülünü sentetik temiz momentlerle doğrula
+    # (FFT'siz — M_xx = M_yy = c·w verilirse U = 0.5·D·mean((2c·w/(D(1+ν)))²)
+    # olmalı; (1+ν) böleni bozulursa bu assert kırılır)
+    from spine import PlateState
+    c = 123.4
+    M_syn = c * w
+    zero = torch.zeros_like(w)
+    state_syn = PlateState(w=w, theta_x=zero, theta_y=zero,
+                           M_xx=M_syn, M_yy=M_syn, M_xy=zero)
+    U_syn = state_syn.strain_energy(D, nu).item()
+    U_ref = (0.5 * D * ((2 * c * w / (D * (1 + nu))) ** 2).mean()).item()
+    assert abs(U_syn - U_ref) / U_ref < 1e-6, \
+        f"strain_energy iç formülü sapıyor: {U_syn:.6e} vs {U_ref:.6e}"
+    # Not: FFT'li gerçek alanda U'nun MUTLAK değeri kenar Gibbs artefaktları
+    # nedeniyle güvenilir değildir (bilinen sınırlama) — burada test edilen
+    # şey formülün kendisidir, alan integrali değil.
+    print(f"[Enerji] ∇²w geri kazanım oranı {ratio:.4f}, iç formül doğrulandı — OK")
 
 
 def test_shell_consistency():
