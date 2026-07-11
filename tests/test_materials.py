@@ -7,11 +7,16 @@ Basit metallerden egzotik kompozitlere kadar test.
 Yazar: SPINE Project
 """
 
-import torch
-import numpy as np
+import os
+import sys
 import time
 from typing import Dict, List
-import sys
+
+import numpy as np
+import torch
+
+# Repo kökünü dinamik bul (tests/ dizininin bir üstü)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # SPINE modülleri
 from materials import (
@@ -104,14 +109,28 @@ def test_isotropic_buckling():
         print("\n" + "-" * 78)
         best_absolute = max(results, key=lambda x: x['N_cr'])
         best_specific = max(results, key=lambda x: x['specific'])
-        
+
         print(f"\n🏆 En yüksek mutlak dayanım: {best_absolute['name']}")
         print(f"   N_cr = {best_absolute['N_cr']/1000:.2f} kN/m")
-        
+
         print(f"\n🏆 En yüksek spesifik dayanım: {best_specific['name']}")
         print(f"   N_cr/ρ = {best_specific['specific']:.2f}")
-    
-    return results
+
+    # Doğrulamalar
+    assert len(results) == len(materials), \
+        f"{len(materials) - len(results)} malzeme kütüphanede bulunamadı"
+    assert all(r['N_cr'] > 0 for r in results), "negatif/sıfır kritik yük"
+    assert best_absolute['name'] == 'diamond', \
+        "en rijit malzeme (elmas) en yüksek N_cr vermeli"
+
+    # Referans karşılaştırması: çelik 304 için formülü bağımsız hesapla
+    import math
+    steel = MaterialLibrary.get("steel_304")
+    D_ref = steel.E * h**3 / (12 * (1 - steel.nu**2))
+    N_ref = D_ref * ((math.pi/Lx)**2 + (math.pi/Ly)**2)**2 / (math.pi/Lx)**2
+    steel_res = next(r for r in results if r['name'] == 'steel_304')
+    assert abs(steel_res['N_cr'] - N_ref) / N_ref < 1e-9, \
+        "steel_304 N_cr, plate_rigidity ile hesaplanan formülden sapıyor"
 
 
 def test_orthotropic_buckling():
@@ -204,13 +223,19 @@ def test_orthotropic_buckling():
         print("\n" + "-" * 82)
         best = max(results, key=lambda x: x['N_cr'])
         best_specific = max(results, key=lambda x: x['N_cr']/x['rho'])
-        
+
         print(f"\n🏆 En yüksek dayanım: {best['name']}")
         print(f"   N_cr = {best['N_cr']/1000:.2f} kN/m")
-        
+
         print(f"\n🏆 En yüksek spesifik: {best_specific['name']}")
-    
-    return results
+
+    # Doğrulamalar
+    assert len(results) == len(composites), \
+        f"{len(composites) - len(results)} kompozit kütüphanede bulunamadı"
+    assert all(r['N_cr'] > 0 for r in results), "negatif/sıfır kritik yük"
+    # Tek yönlü kompozitte fiber yönü daha rijit olmalı
+    assert all(r['E1'] > r['E2'] for r in results), \
+        "tek yönlü kompozitte E1 > E2 olmalı"
 
 
 def test_composite_laminates():
@@ -277,17 +302,28 @@ def test_composite_laminates():
     
     print(f"\n{'Dizilim':<35} {'Kalınlık':<12} {'Simetrik':<10} {'N_cr (kN/m)':<12}")
     print("-" * 75)
-    
+
     for name, plies in laminates.items():
         laminate = CompositeLaminate(plies)
         result = laminate.find_critical_buckling(Lx, Ly)
-        
+
         sym = "✓" if laminate.is_symmetric() else "✗"
-        
+
         print(f"{name:<35} {laminate.total_thickness*1000:.2f}mm      "
               f"{sym:<10} {result['N_cr']/1000:<12.2f}")
-    
-    return laminates
+
+        assert result['N_cr'] > 0, f"{name}: kritik yük pozitif olmalı"
+        assert laminate.is_symmetric(), f"{name}: dizilim simetrik tasarlandı"
+
+    # CLT klasik sonucu: quasi-isotropic laminat düzlem-içi izotroptur
+    # (A11 = A22 ve A66 = (A11 - A12)/2)
+    quasi = CompositeLaminate(laminates["Quasi-isotropic [0/±45/90]s"])
+    A, B, D = quasi.get_ABD_matrices()
+    assert abs(A[0, 0] - A[1, 1]) / A[0, 0] < 0.01, \
+        f"quasi-isotropic A11≠A22: {A[0,0]:.3e} vs {A[1,1]:.3e}"
+    assert abs(A[2, 2] - (A[0, 0] - A[0, 1]) / 2) / A[2, 2] < 0.01, \
+        "quasi-isotropic A66 ≠ (A11-A12)/2"
+    print("\n[CLT] Quasi-isotropic düzlem-içi izotropi doğrulandı — OK")
 
 
 def test_exotic_materials():
@@ -400,16 +436,27 @@ def test_material_neuron():
     result = neuron(steel, h)
     print(f"\nİzotropik (Çelik 304, h=5mm):")
     print(f"  D = {result['D'].item():.2f} N·m")
-    
+
+    D_ref = steel.plate_rigidity(h.item())
+    assert abs(result['D'].item() - D_ref) / D_ref < 1e-6, \
+        "nöron D'si plate_rigidity ile eşleşmeli"
+
     # Ortotropik test
     carbon = MaterialLibrary.get("carbon_epoxy_T300")
-    
+
     result = neuron(carbon, h)
     print(f"\nOrtotropik (Karbon T300, h=5mm):")
     print(f"  D11 = {result['D11'].item():.2f} N·m")
     print(f"  D22 = {result['D22'].item():.2f} N·m")
     print(f"  D12 = {result['D12'].item():.2f} N·m")
     print(f"  D66 = {result['D66'].item():.2f} N·m")
+
+    assert result['D11'].item() > result['D22'].item(), \
+        "tek yönlü karbon: fiber yönü rijitliği D11 > D22 olmalı"
+    Q = carbon.get_Q_matrix()
+    D11_ref = Q[0, 0] * h.item()**3 / 12
+    assert abs(result['D11'].item() - D11_ref) / D11_ref < 1e-6, \
+        "nöron D11'i Q matrisinden hesaplananla eşleşmeli"
 
 
 def test_hybrid_laminate():
@@ -463,12 +510,17 @@ def test_hybrid_laminate():
         Ply(0, t, "carbon_epoxy_T300"),
     ])
     result_pure = pure_carbon.find_critical_buckling(0.5, 0.3)
-    
+
     print(f"\nKarşılaştırma (saf karbon):")
     print(f"  N_cr = {result_pure['N_cr']/1000:.2f} kN/m")
-    
+
     efficiency = result['N_cr'] / result_pure['N_cr'] * 100
     print(f"\nHibrit verimlilik: %{efficiency:.1f} (saf karbona göre)")
+
+    assert result['N_cr'] > 0 and result_pure['N_cr'] > 0
+    assert result['N_cr'] < result_pure['N_cr'], \
+        "cam elyaflı hibrit, saf karbondan daha düşük N_cr vermeli"
+    assert hybrid.is_symmetric(), "hibrit dizilim simetrik tasarlandı"
 
 
 def main():

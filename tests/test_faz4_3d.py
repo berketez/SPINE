@@ -1,252 +1,167 @@
 """
-FAZ 4: 3D Nöron Testleri
-- SpectralOps3D
-- SolidNeuron3D
-- ShellNeuron3D
-- BeamNeuron3D
+FAZ 4 — 3D nöron testleri (güncel API): SpectralOps3D, SolidNeuron3D,
+ShellNeuron3D, BeamNeuron3D.
+
+Eski sürüm argümansız kurucular kullanıyordu (API drift, satır 20'de
+TypeError); bu sürüm güncel imzalarla aynı fizik doğrulamalarını yapar.
+
+Çalıştırma:
+    PYTHONPATH=. python3 tests/test_faz4_3d.py
 """
 
-import torch
 import math
-from spine import SpectralOps3D, SolidNeuron3D, ShellNeuron3D, BeamNeuron3D, DEVICE
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+
+from spine import (
+    BeamNeuron3D,
+    MaterialProperties,
+    ShellNeuron3D,
+    SolidNeuron3D,
+    SpectralOps3D,
+)
+
+E_STEEL, NU_STEEL = 200e9, 0.3
 
 
-def test_spectral_ops_3d():
-    """3D Spektral operatörler testi."""
-    print("=" * 60)
-    print("TEST 1: SpectralOps3D")
-    print("=" * 60)
-
-    ops = SpectralOps3D()
-
-    # 3D grid (FFT için endpoint=False gerekli!)
+def test_spectral_ops_3d_periodic():
+    """3D spektral operatörler periyodik rejimde:
+    ∇²[sin(x)sin(y)sin(z)] = -3·f, ∇·(∇f) = ∇²f."""
     N = 32
-    Lx, Ly, Lz = 1.0, 1.0, 1.0
-    dx = Lx / N
+    L = 2 * math.pi
+    ops = SpectralOps3D(resolution=N, Lx=L, Ly=L, Lz=L)
 
-    # Dalga sayıları
-    wn = ops.create_wavenumbers(N, N, N, Lx, Ly, Lz, DEVICE)
+    x = torch.arange(N) * (L / N)
+    X, Y, Z = torch.meshgrid(x, x, x, indexing="ij")
+    f = torch.sin(X) * torch.sin(Y) * torch.sin(Z)
 
-    # FFT için doğru grid (endpoint dahil değil)
-    x = torch.arange(0, N, device=DEVICE) * dx
-    y = torch.arange(0, N, device=DEVICE) * dx
-    z = torch.arange(0, N, device=DEVICE) * dx
-    X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
+    lap = ops.laplacian(f)
+    rel = (torch.norm(lap + 3.0 * f) / torch.norm(3.0 * f)).item()
+    assert rel < 1e-4, f"3D Laplasyen bağıl hata {rel:.2e}"
 
-    # Test fonksiyonu: f = sin(2πx) × sin(2πy) × sin(2πz)
-    f = torch.sin(2 * math.pi * X) * torch.sin(2 * math.pi * Y) * torch.sin(2 * math.pi * Z)
-
-    # Laplacian testi
-    # ∇²f = -12π²f (çünkü ∂²f/∂x² = -4π²f vs.)
-    lap_f = ops.laplacian_3d(f, wn['k_squared'])
-    lap_analytical = -12 * math.pi**2 * f
-
-    # Sadece iç noktalarda karşılaştır (sınır etkisini azalt)
-    error = torch.abs(lap_f - lap_analytical).mean() / (torch.abs(lap_analytical).mean() + 1e-10)
-
-    print(f"Grid: {N}×{N}×{N}")
-    print(f"Test fonksiyonu: sin(2πx)×sin(2πy)×sin(2πz)")
-    print(f"Laplacian hatası: {error.item()*100:.4f}%")
-    print("✅ SpectralOps3D BAŞARILI")
-    print()
+    # Tutarlılık: div(grad f) = ∇²f
+    gx, gy, gz = ops.gradient(f)
+    div_grad = ops.divergence(gx, gy, gz)
+    rel2 = (torch.norm(div_grad - lap) / torch.norm(lap)).item()
+    assert rel2 < 1e-4, f"div∘grad ≠ laplacian: {rel2:.2e}"
+    print(f"[3D Spektral] ∇² hata {rel:.1e}, div∘grad tutarlılık {rel2:.1e} — OK")
 
 
-def test_solid_3d():
-    """3D Elastisite testi."""
-    print("=" * 60)
-    print("TEST 2: SolidNeuron3D - 3D Elastisite")
-    print("=" * 60)
+def test_solid_3d_hooke():
+    """3D Hooke yasası: Lamé sabitleri, tek eksenli şekil değiştirme durumu
+    (σ_xx = (λ+2μ)ε, σ_yy = σ_zz = λε) ve saf kaymada von Mises = √3·τ."""
+    solid = SolidNeuron3D(resolution=8, Lx=1, Ly=1, Lz=1, E=E_STEEL, nu=NU_STEEL)
 
-    solid = SolidNeuron3D().to(DEVICE)
+    lam, mu = solid.lame_parameters()
+    lam_ref = E_STEEL * NU_STEEL / ((1 + NU_STEEL) * (1 - 2 * NU_STEEL))
+    mu_ref = E_STEEL / (2 * (1 + NU_STEEL))
+    assert abs(lam - lam_ref) / lam_ref < 1e-9
+    assert abs(mu - mu_ref) / mu_ref < 1e-9
 
-    # Çelik
-    E = torch.tensor([200e9], device=DEVICE)
-    nu = torch.tensor([0.3], device=DEVICE)
+    shape = (8, 8, 8)
+    zero = torch.zeros(shape)
 
-    # Basit çekme durumu: ε_xx = 0.001, diğerleri 0
-    eps_xx = torch.tensor([0.001], device=DEVICE)
-    eps_yy = torch.tensor([0.0], device=DEVICE)
-    eps_zz = torch.tensor([0.0], device=DEVICE)
-    gamma_yz = torch.tensor([0.0], device=DEVICE)
-    gamma_xz = torch.tensor([0.0], device=DEVICE)
-    gamma_xy = torch.tensor([0.0], device=DEVICE)
+    # Tek eksenli şekil değiştirme (constrained): ε_xx = 1e-3, diğerleri 0
+    eps = 1e-3
+    strain = {"eps_xx": torch.full(shape, eps), "eps_yy": zero, "eps_zz": zero,
+              "eps_xy": zero, "eps_xz": zero, "eps_yz": zero}
+    with torch.no_grad():
+        stress = solid.stress_from_strain(strain)
+    s_xx_ref = (lam_ref + 2 * mu_ref) * eps
+    s_yy_ref = lam_ref * eps
+    assert abs(stress["sigma_xx"][0, 0, 0].item() - s_xx_ref) / s_xx_ref < 1e-6
+    assert abs(stress["sigma_yy"][0, 0, 0].item() - s_yy_ref) / s_yy_ref < 1e-6
+    assert torch.allclose(stress["sigma_yy"], stress["sigma_zz"])
 
-    # Gerilme hesapla
-    sigma_xx, sigma_yy, sigma_zz, tau_yz, tau_xz, tau_xy = \
-        solid.compute_stress(E, nu, eps_xx, eps_yy, eps_zz, gamma_yz, gamma_xz, gamma_xy)
-
-    # Analitik çözüm (tek eksenli çekme, yanal tutuklu)
-    # σ_xx = E(1-ν)/[(1+ν)(1-2ν)] × ε_xx
-    factor = E * (1 - nu) / ((1 + nu) * (1 - 2 * nu))
-    sigma_xx_analytical = factor * eps_xx
-
-    print(f"Malzeme: Çelik (E=200 GPa, ν=0.3)")
-    print(f"Şekil değiştirme: ε_xx = 0.1%")
-    print()
-    print(f"SPINE σ_xx:     {sigma_xx.item()/1e6:.2f} MPa")
-    print(f"Analitik σ_xx:  {sigma_xx_analytical.item()/1e6:.2f} MPa")
-    print(f"Hata:           {abs(sigma_xx.item() - sigma_xx_analytical.item())/sigma_xx_analytical.item()*100:.2f}%")
-    print()
-
-    # Von Mises testi (saf çekme için σ_vm = σ_xx)
-    sigma_vm = solid.von_mises_stress(sigma_xx, sigma_yy, sigma_zz, tau_yz, tau_xz, tau_xy)
-    print(f"Von Mises gerilme: {sigma_vm.item()/1e6:.2f} MPa")
-
-    print("✅ SolidNeuron3D BAŞARILI")
-    print()
+    # Saf kayma: ε_xy = γ/2 → τ = 2με_xy, von Mises = √3·τ
+    gamma_half = 5e-4
+    strain_shear = {"eps_xx": zero, "eps_yy": zero, "eps_zz": zero,
+                    "eps_xy": torch.full(shape, gamma_half),
+                    "eps_xz": zero, "eps_yz": zero}
+    with torch.no_grad():
+        stress_s = solid.stress_from_strain(strain_shear)
+        vm = solid.von_mises_stress(stress_s)
+    tau = 2 * mu_ref * gamma_half
+    vm_ref = math.sqrt(3) * tau
+    assert abs(vm[0, 0, 0].item() - vm_ref) / vm_ref < 1e-6, \
+        f"von Mises {vm[0,0,0].item():.4e} vs √3·τ={vm_ref:.4e}"
+    print("[Solid3D] Lamé + tek eksenli Hooke + von Mises(√3τ) birebir — OK")
 
 
-def test_shell_3d():
-    """Kabuk elemanı testi."""
-    print("=" * 60)
-    print("TEST 3: ShellNeuron3D - Kabuk Elemanı")
-    print("=" * 60)
+def test_shell_3d_constitutive():
+    """Kabuk bünye denklemleri (doğrudan κ/ε girdisiyle, FFT'siz — saf
+    kapalı form): Mx = D(κx + ν·κy), Nx = A(εx + ν·εy);
+    D = Eh³/[12(1-ν²)], A = Eh/(1-ν²)."""
+    h = 0.005
+    shell = ShellNeuron3D(resolution=16, Lx=1.0, Ly=1.0, h=h,
+                          E=E_STEEL, nu=NU_STEEL)
 
-    shell = ShellNeuron3D().to(DEVICE)
+    D_ref = E_STEEL * h**3 / (12 * (1 - NU_STEEL**2))
+    A_ref = E_STEEL * h / (1 - NU_STEEL**2)
+    assert abs(shell.D - D_ref) / D_ref < 1e-12
+    assert abs(shell.A - A_ref) / A_ref < 1e-12
 
-    # Çelik kabuk
-    E = torch.tensor([200e9], device=DEVICE)
-    nu = torch.tensor([0.3], device=DEVICE)
-    h = torch.tensor([0.01], device=DEVICE)  # 10 mm
+    shape = (16, 16)
+    kx = torch.full(shape, 0.1)
+    ky = torch.full(shape, 0.05)
+    kxy = torch.full(shape, 0.02)
+    with torch.no_grad():
+        Mx, My, Mxy = shell.bending_moments(kx, ky, kxy)
+    assert abs(Mx[0, 0].item() - D_ref * (0.1 + NU_STEEL * 0.05)) < 1e-6 * D_ref
+    assert abs(My[0, 0].item() - D_ref * (0.05 + NU_STEEL * 0.1)) < 1e-6 * D_ref
+    assert abs(Mxy[0, 0].item() - D_ref * (1 - NU_STEEL) / 2 * 0.02) < 1e-6 * D_ref
 
-    # Membran şekil değiştirmesi
-    eps_xx = torch.tensor([0.001], device=DEVICE)
-    eps_yy = torch.tensor([0.0005], device=DEVICE)
-    gamma_xy = torch.tensor([0.0], device=DEVICE)
-
-    # Eğrilik
-    kappa_xx = torch.tensor([0.1], device=DEVICE)  # 1/m
-    kappa_yy = torch.tensor([0.05], device=DEVICE)
-    kappa_xy = torch.tensor([0.0], device=DEVICE)
-
-    result = shell(E, nu, h, eps_xx, eps_yy, gamma_xy, kappa_xx, kappa_yy, kappa_xy)
-
-    # Analitik membran kuvveti
-    # N_x = Eh/(1-ν²) × (ε_xx + ν×ε_yy)
-    A = E * h / (1 - nu**2)
-    N_x_analytical = A * (eps_xx + nu * eps_yy)
-
-    N_x_spine = result['N_x']
-
-    print(f"Kabuk: h = {h.item()*1000:.1f} mm")
-    print()
-    print(f"Membran kuvveti N_x:")
-    print(f"  SPINE:     {N_x_spine.item()/1e6:.2f} MN/m")
-    print(f"  Analitik:  {N_x_analytical.item()/1e6:.2f} MN/m")
-    print(f"  Hata:      {abs(N_x_spine.item() - N_x_analytical.item())/N_x_analytical.item()*100:.2f}%")
-    print()
-    print(f"Eğilme momenti M_x: {result['M_x'].item()/1e3:.2f} kN·m/m")
-    print(f"Plaka rijitliği D:  {result['D'].item()/1e6:.2f} MN·m")
-
-    print("✅ ShellNeuron3D BAŞARILI")
-    print()
+    ex = torch.full(shape, 1e-4)
+    ey = torch.full(shape, 5e-5)
+    gxy = torch.full(shape, 2e-5)
+    with torch.no_grad():
+        Nx, Ny, Nxy = shell.membrane_forces(ex, ey, gxy)
+    assert abs(Nx[0, 0].item() - A_ref * (1e-4 + NU_STEEL * 5e-5)) < 1e-6 * A_ref * 1e-4
+    assert abs(Nxy[0, 0].item() - A_ref * (1 - NU_STEEL) / 2 * 2e-5) < 1e-6 * A_ref * 1e-4
+    print("[Shell3D] D, A, momentler ve membran kuvvetleri kapalı formla birebir — OK")
 
 
 def test_beam_3d():
-    """Kiriş elemanı testi."""
-    print("=" * 60)
-    print("TEST 4: BeamNeuron3D - Kiriş Elemanı")
-    print("=" * 60)
+    """Kiriş: Euler burkulması P_cr = π²EI/(KL)², doğal frekans (Hz) ve
+    uniform yüklü basit kirişte w_max = 5qL⁴/(384EI)."""
+    L, I, A, rho = 2.0, 8.33e-6, 0.01, 7850.0  # 10cm kare kesit
+    beam = BeamNeuron3D(length=L, resolution=256, E=E_STEEL, I=I, A=A,
+                        rho=rho, nu=NU_STEEL)
 
-    beam = BeamNeuron3D().to(DEVICE)
+    # Euler burkulması, K faktörü davranışıyla birlikte
+    P_ref = math.pi**2 * E_STEEL * I / L**2
+    assert abs(beam.critical_buckling_load(n=1, K=1.0) - P_ref) / P_ref < 1e-9
+    assert abs(beam.critical_buckling_load(n=1, K=2.0) - P_ref / 4) / P_ref < 1e-9
+    assert abs(beam.critical_buckling_load(n=1, K=0.5) - 4 * P_ref) / P_ref < 1e-9
 
-    # Çelik kiriş
-    E = torch.tensor([200e9], device=DEVICE)
-    L = torch.tensor([3.0], device=DEVICE)  # 3 m
+    # Doğal frekans (Hz döndürür — bilinen API davranışı)
+    f1 = beam.natural_frequency(n=1, theory="euler")
+    f1_ref = (math.pi / L) ** 2 * math.sqrt(E_STEEL * I / (rho * A)) / (2 * math.pi)
+    assert abs(f1 - f1_ref) / f1_ref < 1e-9, f"f₁={f1:.3f} Hz vs {f1_ref:.3f} Hz"
 
-    # Dikdörtgen kesit: 100mm × 200mm
-    b = 0.1  # m
-    h = 0.2  # m
+    # Uniform yük: Navier serisi w_max ↔ 5qL⁴/(384EI)
+    q_val = 1000.0  # N/m
+    q = torch.full((256,), q_val)
+    with torch.no_grad():
+        w = beam.euler_bernoulli_solve(q)
+    w_max_ref = 5 * q_val * L**4 / (384 * E_STEEL * I)
+    rel = abs(w.max().item() - w_max_ref) / w_max_ref
+    assert rel < 0.02, f"w_max={w.max().item():.6e} vs {w_max_ref:.6e} ({rel:.2%})"
 
-    # Dağıtılmış yük
-    q = torch.tensor([10000.0], device=DEVICE)  # 10 kN/m
-
-    # Burkulma için eksenel yük
-    P = torch.tensor([100000.0], device=DEVICE)  # 100 kN
-
-    result = beam(E, L, 'rectangular', q=q, P=P, bc='simply_supported', b=b, h=h)
-
-    # Analitik çözümler
-    I = b * h**3 / 12
-    w_max_analytical = 5 * q.item() * L.item()**4 / (384 * E.item() * I)
-    P_cr_analytical = math.pi**2 * E.item() * I / L.item()**2
-
-    print(f"Kiriş: L = {L.item()} m, kesit = {b*1000:.0f}mm × {h*1000:.0f}mm")
-    print(f"Yük: q = {q.item()/1000:.1f} kN/m, P = {P.item()/1000:.1f} kN")
-    print()
-    print(f"Kesit özellikleri:")
-    print(f"  A = {result['A']*1e4:.2f} cm²")
-    print(f"  I_y = {result['I_y']*1e8:.2f} cm⁴")
-    print()
-    print(f"Maksimum sehim:")
-    print(f"  SPINE:     {result['w_max'].item()*1000:.3f} mm")
-    print(f"  Analitik:  {w_max_analytical*1000:.3f} mm")
-    print(f"  Hata:      {abs(result['w_max'].item() - w_max_analytical)/w_max_analytical*100:.2f}%")
-    print()
-    print(f"Euler burkulma yükü:")
-    print(f"  SPINE P_cr:    {result['P_cr'].item()/1e6:.2f} MN")
-    print(f"  Analitik P_cr: {P_cr_analytical/1e6:.2f} MN")
-    print(f"  Hata:          {abs(result['P_cr'].item() - P_cr_analytical)/P_cr_analytical*100:.2f}%")
-    print()
-    print(f"Burkulma güvenlik katsayısı: {result['buckling_safety'].item():.1f}")
-
-    print("✅ BeamNeuron3D BAŞARILI")
-    print()
-
-
-def test_beam_sections():
-    """Farklı kesit tipleri testi."""
-    print("=" * 60)
-    print("TEST 5: BeamNeuron3D - Kesit Tipleri")
-    print("=" * 60)
-
-    beam = BeamNeuron3D().to(DEVICE)
-    E = torch.tensor([200e9], device=DEVICE)
-    L = torch.tensor([5.0], device=DEVICE)
-    P = torch.tensor([500000.0], device=DEVICE)  # 500 kN
-
-    print("Farklı kesitlerin burkulma kapasitesi karşılaştırması:")
-    print()
-
-    # 1. Dikdörtgen kesit
-    result_rect = beam(E, L, 'rectangular', P=P, bc='simply_supported', b=0.15, h=0.30)
-    print(f"Dikdörtgen (150×300mm): P_cr = {result_rect['P_cr'].item()/1e6:.2f} MN")
-
-    # 2. Dairesel kesit
-    result_circ = beam(E, L, 'circular', P=P, bc='simply_supported', r=0.10)
-    print(f"Dairesel (R=100mm):     P_cr = {result_circ['P_cr'].item()/1e6:.2f} MN")
-
-    # 3. I-profil
-    result_I = beam(E, L, 'I-beam', P=P, bc='simply_supported',
-                    b_f=0.20, t_f=0.015, h_w=0.30, t_w=0.010)
-    print(f"I-profil (IPE 300):     P_cr = {result_I['P_cr'].item()/1e6:.2f} MN")
-
-    print()
-    print("Güvenlik katsayıları:")
-    print(f"  Dikdörtgen: {result_rect['buckling_safety'].item():.1f}")
-    print(f"  Dairesel:   {result_circ['buckling_safety'].item():.1f}")
-    print(f"  I-profil:   {result_I['buckling_safety'].item():.1f}")
-
-    print("✅ Kesit tipleri testi BAŞARILI")
-    print()
-
-
-def test_all():
-    """Tüm 3D testleri çalıştır."""
-    print("\n" + "=" * 60)
-    print("FAZ 4: 3D NÖRON TESTLERİ")
-    print("=" * 60 + "\n")
-
-    test_spectral_ops_3d()
-    test_solid_3d()
-    test_shell_3d()
-    test_beam_3d()
-    test_beam_sections()
-
-    print("=" * 60)
-    print("TÜM 3D TESTLER BAŞARILI!")
-    print("=" * 60)
+    # Mod şekli: birim genlik, uçlarda sıfır
+    phi = beam.mode_shape(n=1)
+    assert abs(phi.max().item() - 1.0) < 1e-3
+    assert abs(phi[0].item()) < 1e-6
+    print(f"[Beam3D] P_cr(K), f₁={f1:.2f} Hz, w_max sapma {rel:.3%} — OK")
 
 
 if __name__ == "__main__":
-    test_all()
+    test_spectral_ops_3d_periodic()
+    test_solid_3d_hooke()
+    test_shell_3d_constitutive()
+    test_beam_3d()
+    print("\n=== TÜM 4 TEST GEÇTİ ===")

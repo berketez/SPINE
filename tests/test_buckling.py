@@ -1,299 +1,129 @@
 """
-SPINE Kutuphanesi - Burkulma Testi
+SPINE — Burkulma ve spektral çekirdek testleri (güncel API).
 
-Simply supported dikdortgen plaka icin kritik yuk analizi.
-Analitik cozumle karsilastirma.
+Eski sürüm silinen bir API'ye (BoundaryCondition, SpectralOps, MaterialNeuron,
+GeometryNeuron) karşı yazılmıştı ve pytest koleksiyonunu komple kırıyordu.
+Bu sürüm aynı analitik doğrulamaları güncel sınıflarla yapar:
+  - Navier kritik yükü ↔ analitik formül
+  - Klasik k=4 sonucu (a/b=2 basit mesnetli plaka, kritik mod m=2)
+  - Spektral biharmonik/Laplasyen (periyodik domainde, FFT'nin geçerli rejimi)
+  - Çok malzemeli tutarlılık
+
+Çalıştırma:
+    PYTHONPATH=. python3 tests/test_buckling.py
 """
 
+import math
+import os
 import sys
-sys.path.insert(0, '/Users/apple/Desktop/buckneuron')
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-import math
-from spine import (
-    SPINE,
-    BoundaryCondition,
-    SpectralOps,
-    MaterialNeuron,
-    GeometryNeuron,
-    BucklingNeuron,
-    DEVICE
-)
+
+from spine import SPINE, MaterialProperties, SpectralOps2DStruct
 
 
-def test_critical_load():
-    """Kritik yuku analitik formulle karsilastir."""
+def _analytic_navier(D: float, Lx: float, Ly: float, m: int, n: int) -> float:
+    """N_cr = D·[(mπ/Lx)² + (nπ/Ly)²]² / (mπ/Lx)²"""
+    tx = (m * math.pi / Lx) ** 2
+    ty = (n * math.pi / Ly) ** 2
+    return D * (tx + ty) ** 2 / tx
 
-    print("=" * 60)
-    print("SPINE - Burkulma Testi")
-    print("=" * 60)
-    print(f"Device: {DEVICE}")
-    print()
 
-    # Malzeme: Celik
-    E = 200e9   # Pa (200 GPa)
-    nu = 0.3
-    h = 0.005   # m (5 mm)
+def test_critical_load_matches_analytic():
+    """get_critical_load, Navier formülüyle birebir eşleşmeli (birkaç modda)."""
+    mat = MaterialProperties(E=200e9, nu=0.3, h=0.005)
+    Lx, Ly = 1.0, 0.5
+    model = SPINE(resolution=64, Lx=Lx, Ly=Ly, material=mat)
 
-    # Geometri
-    Lx = 1.0    # m
-    Ly = 0.5    # m
+    for m, n in [(1, 1), (2, 1), (3, 2), (1, 3)]:
+        got = model.get_critical_load(m=m, n=n)
+        ref = _analytic_navier(mat.D, Lx, Ly, m, n)
+        rel = abs(got - ref) / ref
+        assert rel < 1e-9, f"mod({m},{n}): N_cr={got:.6e} vs analitik {ref:.6e}"
+    print("[Navier] 4 modda kritik yük analitikle birebir — OK")
 
-    # Plaka rijitligi (analitik)
-    D_analytical = (E * h**3) / (12 * (1 - nu**2))
 
-    print("Malzeme Ozellikleri:")
-    print(f"  E  = {E/1e9:.0f} GPa")
-    print(f"  nu = {nu}")
-    print(f"  h  = {h*1000:.1f} mm")
-    print(f"  D  = {D_analytical:.4e} N.m")
-    print()
+def test_classic_k4_aspect_ratio_two():
+    """Klasik plaka burkulma sonucu: a/b=2 basit mesnetli plakada kritik mod
+    m=2, n=1 ve burkulma katsayısı k = N_cr·b²/(π²D) = 4.0 olmalı
+    (Timoshenko & Gere, Theory of Elastic Stability)."""
+    mat = MaterialProperties(E=200e9, nu=0.3, h=0.005)
+    Lx, Ly = 1.0, 0.5  # a/b = 2
+    model = SPINE(resolution=64, Lx=Lx, Ly=Ly, material=mat)
 
-    print("Geometri:")
-    print(f"  Lx = {Lx*1000:.0f} mm")
-    print(f"  Ly = {Ly*1000:.0f} mm")
-    print(f"  Aspect ratio = {Lx/Ly:.2f}")
-    print()
-
-    # SPINE modeli olustur
-    model = SPINE(
-        resolution=64,
-        bc_type=BoundaryCondition.SIMPLY_SUPPORTED
+    best = min(
+        ((m, n, model.get_critical_load(m=m, n=n))
+         for m in range(1, 6) for n in range(1, 4)),
+        key=lambda t: t[2],
     )
+    m_cr, n_cr, N_cr = best
+    k = N_cr * Ly**2 / (math.pi**2 * mat.D)
 
-    # Model mimarisini yazdir
-    model.print_architecture()
-    print()
-
-    # Tam analiz yap
-    result = model(E=E, nu=nu, h=h, Lx=Lx, Ly=Ly, m=1, n=1)
-
-    print("SPINE Sonuclari:")
-    print("-" * 50)
-    print(f"  Kritik yuk (N_cr): {result.N_cr.item()/1000:.2f} kN/m")
-    print(f"  Plaka rijitligi (D): {result.D.item():.4e} N.m")
-    print()
-
-    # Analitik kritik yuk (m=1, n=1)
-    m, n = 1, 1
-    term_x = (m * math.pi / Lx) ** 2
-    term_y = (n * math.pi / Ly) ** 2
-    N_cr_analytical = D_analytical * ((term_x + term_y) ** 2) / term_x
-
-    print("Analitik Sonuclar:")
-    print("-" * 50)
-    print(f"  N_cr (analitik): {N_cr_analytical/1000:.2f} kN/m")
-    print()
-
-    # Hata
-    error = abs(result.N_cr.item() - N_cr_analytical) / N_cr_analytical * 100
-    print(f"Bagil hata: {error:.4f}%")
-    print()
-
-    # Kritik modlari bul
-    print("Kritik Burkulma Yukleri:")
-    print("-" * 50)
-    print(f"{'Mod':<6} {'m':<4} {'n':<4} {'N_cr (kN/m)':<15}")
-    print("-" * 50)
-
-    modes = model.analyze_buckling(E=E, nu=nu, h=h, Lx=Lx, Ly=Ly, max_modes=5)
-
-    for i, mode in enumerate(modes[:6], 1):
-        print(f"{i:<6} {mode['m']:<4} {mode['n']:<4} {mode['N_cr']/1000:<15.2f}")
-
-    print("-" * 50)
-
-    # Mod sekli istatistikleri
-    print()
-    print("Mod sekli istatistikleri (m=1, n=1):")
-    print(f"  max(w)  = {result.w.max().item():.4f}")
-    print(f"  min(w)  = {result.w.min().item():.4f}")
-    print(f"  mean(w) = {result.w.mean().item():.6f}")
-
-    # Gerilme istatistikleri
-    print()
-    print("Gerilme istatistikleri:")
-    print(f"  max(sigma_xx) = {result.sigma_xx.max().item():.4e} Pa")
-    print(f"  max(sigma_yy) = {result.sigma_yy.max().item():.4e} Pa")
-    print(f"  max(sigma_xy) = {result.sigma_xy.max().item():.4e} Pa")
-
-    print()
-    print("=" * 60)
-    if error < 1.0:
-        print("TEST BASARILI! Hata < 1%")
-    else:
-        print(f"TEST UYARISI: Hata = {error:.2f}%")
-    print("=" * 60)
-
-    return result.N_cr.item(), N_cr_analytical
+    assert (m_cr, n_cr) == (2, 1), f"kritik mod ({m_cr},{n_cr}), (2,1) olmalı"
+    assert abs(k - 4.0) < 1e-6, f"burkulma katsayısı k={k:.6f}, 4.0 olmalı"
+    print(f"[k=4] kritik mod (2,1), k={k:.6f} — OK")
 
 
-def test_spectral_biharmonic():
-    """Spektral biharmonik operatoru test et (periyodik domain)."""
+def test_spectral_biharmonic_periodic_domain():
+    """FFT operatörleri kendi geçerli rejiminde (tam periyodik sinyal,
+    uç-nokta-hariç grid) makine hassasiyetinde olmalı:
+    ∇⁴[sin(x)·sin(y)] = 4·sin(x)·sin(y), ∇²[...] = -2·[...] on [0,2π)².
 
-    print()
-    print("=" * 60)
-    print("Spektral Biharmonik Testi (Periyodik Domain)")
-    print("=" * 60)
+    float64 kullanılır: float32'de FFT taban gürültüsü (~1e-7) k⁴ ile
+    ~10⁶ kat amplifiye olup %2'ye çıkar — bu hassasiyet sınırıdır,
+    operatör hatası değil.
+    """
+    N = 64
+    L = 2 * math.pi
+    ops = SpectralOps2DStruct(resolution=N, Lx=L, Ly=L).double()
 
-    resolution = 64
-    Lx = 2 * math.pi
-    Ly = 2 * math.pi
-
-    # SpectralOps
-    ops = SpectralOps()
-
-    # Dalga sayilari
-    kx = torch.fft.fftfreq(resolution, d=Lx/resolution) * 2 * math.pi
-    ky = torch.fft.fftfreq(resolution, d=Ly/resolution) * 2 * math.pi
-    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
-    k_squared = KX**2 + KY**2
-    k_fourth = k_squared**2
-
-    # Grid (periyodik icin endpoint dahil degil)
-    dx = Lx / resolution
-    dy = Ly / resolution
-    x = torch.arange(0, Lx, dx)
-    y = torch.arange(0, Ly, dy)
-    X, Y = torch.meshgrid(x, y, indexing='ij')
-
-    # Test fonksiyonu: sin(x) * sin(y)
-    # Bu periyodik: f(0) = f(2pi) ve turevleri de oyle
+    # Periyodik grid: uç nokta HARİÇ (FFT konvansiyonu)
+    x = torch.arange(N, dtype=torch.float64) * (L / N)
+    X, Y = torch.meshgrid(x, x, indexing="ij")
     w = torch.sin(X) * torch.sin(Y)
 
-    # Spektral biharmonik
-    biharm_spectral = ops.biharmonic(w, k_fourth)
+    biharm = ops.biharmonic(w)
+    lap = ops.laplacian(w)
 
-    # Analitik: nabla4[sin(x)sin(y)] = (1+1)^2 * sin(x)sin(y) = 4 * sin(x)sin(y)
-    biharm_analytical = 4.0 * w
-
-    # Hata
-    error = torch.abs(biharm_spectral - biharm_analytical).max()
-    rel_error = error / torch.abs(biharm_analytical).max()
-
-    print(f"Test fonksiyonu: sin(x) * sin(y)")
-    print(f"Domain: [0, 2pi] x [0, 2pi]")
-    print(f"Resolution: {resolution} x {resolution}")
-    print()
-    print(f"Analitik nabla4(w) = 4 * sin(x)sin(y)")
-    print()
-    print(f"Maksimum mutlak hata: {error:.2e}")
-    print(f"Bagil hata: {rel_error:.2e}")
-    print()
-
-    if rel_error < 1e-5:
-        print("PASSED: Spektral biharmonik dogru calisiyor!")
-    else:
-        print("FAILED: Hata cok yuksek!")
-
-    print("=" * 60)
-
-    return rel_error < 1e-5
+    rel_b = (torch.norm(biharm - 4.0 * w) / torch.norm(4.0 * w)).item()
+    rel_l = (torch.norm(lap + 2.0 * w) / torch.norm(2.0 * w)).item()
+    assert rel_b < 1e-9, f"biharmonik bağıl hata {rel_b:.2e}"
+    assert rel_l < 1e-9, f"Laplasyen bağıl hata {rel_l:.2e}"
+    print(f"[Spektral] periyodik domain (float64): ∇⁴ hata {rel_b:.1e}, ∇² hata {rel_l:.1e} — OK")
 
 
-def test_material_neuron():
-    """MaterialNeuron'u test et."""
-
-    print()
-    print("=" * 60)
-    print("MaterialNeuron Testi")
-    print("=" * 60)
-
-    neuron = MaterialNeuron()
-
-    # Test degerleri
-    E = torch.tensor([200e9])   # Celik
-    nu = torch.tensor([0.3])
-    h = torch.tensor([0.005])
-
-    # Hesapla
-    D = neuron(E, nu, h)
-
-    # Analitik
-    D_analytical = (E * h**3) / (12 * (1 - nu**2))
-
-    print(f"E = {E.item()/1e9:.0f} GPa")
-    print(f"nu = {nu.item()}")
-    print(f"h = {h.item()*1000:.1f} mm")
-    print()
-    print(f"D (neuron): {D.item():.4e} N.m")
-    print(f"D (analitik): {D_analytical.item():.4e} N.m")
-    print()
-
-    error = abs(D.item() - D_analytical.item()) / D_analytical.item() * 100
-    print(f"Bagil hata: {error:.6f}%")
-
-    if error < 0.01:
-        print("PASSED: MaterialNeuron dogru calisiyor!")
-    else:
-        print("FAILED!")
-
-    print("=" * 60)
-
-    return error < 0.01
-
-
-def test_full_pipeline():
-    """Tam SPINE pipeline'ini test et."""
-
-    print()
-    print("=" * 60)
-    print("Tam SPINE Pipeline Testi")
-    print("=" * 60)
-
-    # Farkli malzemeler
-    materials = [
-        {"name": "Celik", "E": 200e9, "nu": 0.3, "h": 0.005},
-        {"name": "Aluminyum", "E": 70e9, "nu": 0.33, "h": 0.003},
-        {"name": "Titanyum", "E": 116e9, "nu": 0.34, "h": 0.004},
-    ]
-
+def test_multi_material_pipeline():
+    """Farklı malzemelerde uçtan uca akış: D formülü, kritik yük ve
+    forward geçişi tutarlı olmalı."""
+    materials = {
+        "çelik": MaterialProperties(E=200e9, nu=0.3, h=0.005),
+        "alüminyum": MaterialProperties(E=70e9, nu=0.33, h=0.003),
+        "titanyum": MaterialProperties(E=116e9, nu=0.34, h=0.004),
+    }
     Lx, Ly = 1.0, 0.5
 
-    model = SPINE(resolution=64)
+    for name, mat in materials.items():
+        D_ref = mat.E * mat.h**3 / (12 * (1 - mat.nu**2))
+        assert abs(mat.D - D_ref) / D_ref < 1e-12, f"{name}: D formülü sapıyor"
 
-    print(f"Geometri: {Lx*1000:.0f} mm x {Ly*1000:.0f} mm")
-    print()
-    print(f"{'Malzeme':<12} {'E (GPa)':<10} {'h (mm)':<8} {'N_cr (kN/m)':<15} {'D (N.m)':<12}")
-    print("-" * 65)
+        model = SPINE(resolution=64, Lx=Lx, Ly=Ly, material=mat)
+        N_cr = model.get_critical_load(m=1, n=1)
+        ref = _analytic_navier(mat.D, Lx, Ly, 1, 1)
+        assert abs(N_cr - ref) / ref < 1e-9, f"{name}: N_cr sapıyor"
+        assert N_cr > 0
 
-    for mat in materials:
-        result = model(
-            E=mat["E"],
-            nu=mat["nu"],
-            h=mat["h"],
-            Lx=Lx,
-            Ly=Ly
-        )
-
-        print(f"{mat['name']:<12} {mat['E']/1e9:<10.0f} {mat['h']*1000:<8.1f} "
-              f"{result.N_cr.item()/1000:<15.2f} {result.D.item():<12.4e}")
-
-    print("-" * 65)
-    print()
-    print("PASSED: Tum malzemeler icin hesaplama basarili!")
-    print("=" * 60)
-
-    return True
+        state = model.forward(model.get_mode_shape(1, 1))
+        assert torch.isfinite(state.M_xx).all(), f"{name}: M_xx sonlu değil"
+        assert abs(state.max_displacement().item() - 1.0) < 0.01, \
+            f"{name}: normalize mod şekli max ~1 olmalı"
+    print(f"[Malzeme] {len(materials)} malzemede D + N_cr + forward tutarlı — OK")
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("SPINE KUTUPHANE TESTLERI")
-    print("=" * 60 + "\n")
-
-    # Test 1: Material Neuron
-    test_material_neuron()
-
-    # Test 2: Spektral operator
-    test_spectral_biharmonic()
-
-    # Test 3: Burkulma analizi
-    test_critical_load()
-
-    # Test 4: Tam pipeline
-    test_full_pipeline()
-
-    print("\n" + "=" * 60)
-    print("TUM TESTLER TAMAMLANDI!")
-    print("=" * 60)
+    test_critical_load_matches_analytic()
+    test_classic_k4_aspect_ratio_two()
+    test_spectral_biharmonic_periodic_domain()
+    test_multi_material_pipeline()
+    print("\n=== TÜM 4 TEST GEÇTİ ===")
