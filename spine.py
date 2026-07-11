@@ -268,13 +268,14 @@ class PlateState:
         """Maksimum deplasman"""
         return torch.max(torch.abs(self.w))
 
-    def strain_energy(self, D: float) -> torch.Tensor:
+    def strain_energy(self, D: float, nu: float) -> torch.Tensor:
         """
         Şekil değiştirme enerjisi:
         U = (D/2) ∫∫ [(∇²w)² - 2(1-ν)(w_xx·w_yy - w_xy²)] dA
         """
         # Basitleştirilmiş: U ≈ (D/2) ∫∫ (∇²w)² dA
-        lap_w_sq = (self.M_xx / D + self.M_yy / D) ** 2
+        # Kirchhoff momentlerinden geri kazanım: M_xx + M_yy = -D(1+ν)·∇²w
+        lap_w_sq = ((self.M_xx + self.M_yy) / (D * (1 + nu))) ** 2
         return 0.5 * D * lap_w_sq.mean(dim=(-2, -1))
 
 
@@ -3002,14 +3003,17 @@ class SPINE(nn.Module):
         # Eğimler
         theta_x, theta_y = self.spectral_ops.gradient(w)
 
-        # Eğrilikler
+        # Eğrilikler (StrainNeuron konvansiyonu: κ_ij = -w_ij)
         kappa_xx, kappa_yy, kappa_xy = self.strain(w)
 
-        # Momentler: M = -D * κ
+        # Momentler (standart Kirchhoff, ShellNeuron3D.bending_moments ile aynı form):
+        # M_x = -D(w_xx + ν·w_yy) = D(κ_xx + ν·κ_yy)
+        # M_xy = -D(1-ν)·w_xy = D(1-ν)·κ_xy  (κ_xy = -w_xy olduğundan çarpan 1-ν, 2'ye bölünmez)
         D = self.material.D
-        M_xx = -D * kappa_xx
-        M_yy = -D * kappa_yy
-        M_xy = -D * kappa_xy
+        nu = self.material.nu
+        M_xx = D * (kappa_xx + nu * kappa_yy)
+        M_yy = D * (kappa_yy + nu * kappa_xx)
+        M_xy = D * (1 - nu) * kappa_xy
 
         return PlateState(
             w=w,
@@ -3026,7 +3030,7 @@ class SPINE(nn.Module):
 
         return {
             'max_displacement': state.max_displacement().item(),
-            'strain_energy': state.strain_energy(self.material.D).mean().item(),
+            'strain_energy': state.strain_energy(self.material.D, self.material.nu).mean().item(),
             'bc_loss': self.boundary.bc_loss(w).item()
         }
 
