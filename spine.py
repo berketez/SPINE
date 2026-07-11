@@ -599,8 +599,11 @@ class BucklingNeuron(nn.Module):
 
         w(x,y) = sin(mπx/L) · sin(nπy/W)
         """
-        x = torch.linspace(0, self.Lx, self.resolution, device=DEVICE)
-        y = torch.linspace(0, self.Ly, self.resolution, device=DEVICE)
+        # Grid, modülün kendi device'ını takip eder (global DEVICE değil):
+        # model taşınmadan MPS'e tensor üretmek buffer'larla device çakışması yaratıyordu
+        device = self.load_scale.device
+        x = torch.linspace(0, self.Lx, self.resolution, device=device)
+        y = torch.linspace(0, self.Ly, self.resolution, device=device)
         X, Y = torch.meshgrid(x, y, indexing='ij')
 
         w = torch.sin(m * math.pi * X / self.Lx) * \
