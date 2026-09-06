@@ -163,6 +163,8 @@ __all__ = [
     'ModalNeuron',
     'CrackNeuron',
     'ThermalNeuron',
+    'HeatConductionNeuron',
+    'PhaseFieldNeuron',
     'PlasticityNeuron',
     'FatigueNeuron',
     'DynamicNeuron',
@@ -2147,6 +2149,330 @@ class ThermalNeuron(nn.Module):
         return f"alpha={self.alpha:.2e}, E={self.E:.2e}"
 
 
+class HeatConductionNeuron(nn.Module):
+    r"""
+    Kararlı-Hal Isı İletimi Nöronu.
+
+    Poisson denklemi:   ∇²T = -f/k   (kaynaklı),  akı:  q = -k·∇T
+
+    İki türev yolu sunar ve ikisi de bilinçli seçimdir:
+
+    • method='spectral' — FFT ile türev. Düzgün, süreksizliksiz alanlarda
+      makine hassasiyetine yakın doğruluk verir. Ancak yalıtılmış bir çatlak
+      gibi SÜREKSİZLİK varsa Gibbs salınımı üretir; orada kullanılmamalıdır.
+
+    • method='fd' — ikinci mertebe sonlu fark, sınırlarda tek taraflı.
+      Süreksizlik ve Dirichlet/Neumann sınırlarıyla uyumludur.
+
+    Bu ayrım önemlidir: SPINE'ın spektral çekirdeği her probleme uygun
+    değildir ve nöron bunu gizlemez.
+
+    Args:
+        resolution: Grid çözünürlüğü.
+        Lx, Ly: Domain boyutları [m].
+        k: Isı iletim katsayısı [W/(m·K)].
+        spectral_ops: Hazır SpectralOps2DStruct (yoksa kurulur).
+    """
+
+    def __init__(self, resolution: int, Lx: float, Ly: float,
+                 k: float = 1.0,
+                 spectral_ops: Optional[SpectralOps2DStruct] = None):
+        super().__init__()
+        self.resolution = resolution
+        self.Lx = Lx
+        self.Ly = Ly
+        self.k = k
+        self.dx = Lx / (resolution - 1)
+        self.dy = Ly / (resolution - 1)
+        self.spectral_ops = spectral_ops if spectral_ops else \
+            SpectralOps2DStruct(resolution, Lx, Ly)
+
+    # --------------------------------------------------------------- türev
+    def gradient_fd(self, T: torch.Tensor
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""
+        İkinci mertebe sonlu farkla gradyan; sınırlarda tek taraflı.
+
+            iç:     (T[i+1] - T[i-1]) / (2h)
+            sol:    (-3T[0] + 4T[1] - T[2]) / (2h)
+            sağ:    ( 3T[-1] - 4T[-2] + T[-3]) / (2h)
+
+        Tek taraflı formüller de ikinci mertebedendir; kenarlarda doğruluk
+        düşmez.
+        """
+        dTdx = torch.zeros_like(T)
+        dTdy = torch.zeros_like(T)
+
+        dTdx[1:-1, :] = (T[2:, :] - T[:-2, :]) / (2 * self.dx)
+        dTdx[0, :] = (-3 * T[0, :] + 4 * T[1, :] - T[2, :]) / (2 * self.dx)
+        dTdx[-1, :] = (3 * T[-1, :] - 4 * T[-2, :] + T[-3, :]) / (2 * self.dx)
+
+        dTdy[:, 1:-1] = (T[:, 2:] - T[:, :-2]) / (2 * self.dy)
+        dTdy[:, 0] = (-3 * T[:, 0] + 4 * T[:, 1] - T[:, 2]) / (2 * self.dy)
+        dTdy[:, -1] = (3 * T[:, -1] - 4 * T[:, -2] + T[:, -3]) / (2 * self.dy)
+
+        return dTdx, dTdy
+
+    def flux(self, T: torch.Tensor, method: str = "fd"
+             ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Isı akısı q = -k·∇T.
+
+        Args:
+            method: 'fd' (süreksizlik/sınır varsa) veya 'spectral'.
+        """
+        if method == "fd":
+            dTdx, dTdy = self.gradient_fd(T)
+        elif method == "spectral":
+            dTdx, dTdy = self.spectral_ops.gradient(T)
+        else:
+            raise ValueError("method 'fd' veya 'spectral' olmalı.")
+        return -self.k * dTdx, -self.k * dTdy
+
+    def laplacian_fd(self, T: torch.Tensor) -> torch.Tensor:
+        """5 noktalı sonlu fark Laplasyeni (kenarlar sıfır bırakılır)."""
+        lap = torch.zeros_like(T)
+        lap[1:-1, 1:-1] = (
+            (T[2:, 1:-1] + T[:-2, 1:-1] - 2 * T[1:-1, 1:-1]) / self.dx ** 2
+            + (T[1:-1, 2:] + T[1:-1, :-2] - 2 * T[1:-1, 1:-1]) / self.dy ** 2
+        )
+        return lap
+
+    def poisson_residual(self, T: torch.Tensor, f: torch.Tensor,
+                         method: str = "fd") -> torch.Tensor:
+        r"""
+        ∇²T - f rezidüeli. Sıfıra ne kadar yakınsa çözüm o kadar tutarlıdır.
+
+        Not: f burada doğrudan ∇²T'nin karşılığıdır (k ile bölünmüş hâli
+        bekleniyorsa çağıran taraf ölçekler).
+        """
+        if method == "fd":
+            lap = self.laplacian_fd(T)
+        elif method == "spectral":
+            lap = self.spectral_ops.laplacian(T)
+        else:
+            raise ValueError("method 'fd' veya 'spectral' olmalı.")
+        return lap - f
+
+    def solve_spectral(self, f: torch.Tensor,
+                       mean_value: float = 0.0) -> torch.Tensor:
+        r"""
+        Periyodik domainde ∇²T = f çözümü (FFT).
+
+            T̂ = -f̂ / k²,   k=0 modu `mean_value` ile sabitlenir
+
+        Yalnızca süreksizliksiz ve periyodik hâller için uygundur;
+        Dirichlet sınırı veya çatlak varsa sonuç yanıltıcıdır.
+        """
+        f_hat = safe_fft2(f)
+        k2 = self.spectral_ops.k_squared
+        k2_safe = k2.clone()
+        k2_safe[0, 0] = 1.0
+
+        T_hat = -f_hat / k2_safe
+        T_hat[0, 0] = 0.0
+        T = safe_ifft2(T_hat).real
+        return T - T.mean() + mean_value
+
+    def forward(self, T: torch.Tensor, method: str = "fd"):
+        """nn.Module arayüzü — akı hesabı."""
+        return self.flux(T, method=method)
+
+    def extra_repr(self) -> str:
+        return f"resolution={self.resolution}, Lx={self.Lx}, Ly={self.Ly}, k={self.k}"
+
+
+class PhaseFieldNeuron(nn.Module):
+    r"""
+    AT2 Faz-Alanı Hasar Nöronu — çatlak, ayrı bir yüzey olarak değil,
+    sürekli bir hasar alanı d ∈ [0,1] olarak temsil edilir (d=0 sağlam,
+    d=1 tamamen çatlak).
+
+    Denge denklemi (AT2, ℓ karakteristik çatlak bandı genişliği):
+
+        (1 + 2ℓH/G_c)·d - ℓ²∇²d = 2ℓH/G_c
+
+    Burada H, tarihçe alanıdır: H = max(H_önceki, ψ⁺). Tarihçe kullanmak
+    çatlağın GERİ DÖNMEMESİNİ (irreversibility) sağlar — yük kalksa bile
+    hasar kaybolmaz.
+
+    Denklem Helmholtz tipindedir ve FFT ile çözülür: sabit katsayılı kısım
+    frekans uzayında doğrudan bölünür, uzayda değişen kısım sabit-nokta
+    yinelemesiyle taşınır.
+
+    İki mod:
+      • mode='at2'    : yukarıdaki tam form (sol tarafta H'ye bağlı katsayı)
+      • mode='linear' : α ≡ 1 alan lineerleştirilmiş form,
+                        d - ℓ²∇²d = 2ℓH/G_c
+        İkincisi daha yumuşak ve gradyan açısından daha kararlıdır; ters
+        problemde (G_c kestirimi) tercih edilir.
+
+    G_c tensör olabilir ve ona göre türev alınabilir — 45 malzemelik
+    tersine mühendislikte kırılma tokluğunun kestirilebilmesinin sebebi budur.
+
+    Args:
+        resolution: Grid çözünürlüğü.
+        Lx, Ly: Domain boyutları [m].
+        ell: Karakteristik uzunluk ℓ [m]; tipik olarak 2-3 grid aralığı.
+        G_c: Kritik enerji salım oranı [J/m²].
+        eta: Bozunum fonksiyonundaki artık rijitlik (sayısal tekilliği önler).
+        spectral_ops: Hazır SpectralOps2DStruct (yoksa kurulur).
+    """
+
+    def __init__(self, resolution: int, Lx: float, Ly: float,
+                 ell: float, G_c: float, eta: float = 1e-7,
+                 spectral_ops: Optional[SpectralOps2DStruct] = None):
+        super().__init__()
+        self.resolution = resolution
+        self.Lx = Lx
+        self.Ly = Ly
+        self.ell = ell
+        self.eta = eta
+        self.spectral_ops = spectral_ops if spectral_ops else \
+            SpectralOps2DStruct(resolution, Lx, Ly)
+        self.register_buffer('G_c', torch.tensor(float(G_c)))
+
+    # ------------------------------------------------------------ bozunum
+    def degradation(self, d: torch.Tensor) -> torch.Tensor:
+        r"""Bozunum fonksiyonu g(d) = (1-d)² + η.
+
+        Hasarlı bölgede rijitlik g(d) ile çarpılır; η, d→1 iken sistemin
+        tekilleşmesini önleyen küçük artık rijitliktir.
+        """
+        return (1.0 - d) ** 2 + self.eta
+
+    @staticmethod
+    def energy_density_strain(eps_xx: torch.Tensor, eps_yy: torch.Tensor,
+                              eps_xy: torch.Tensor,
+                              lam, mu, eps: float = 1e-30) -> torch.Tensor:
+        r"""
+        Gerinimden çekme enerjisi ψ⁺ (spektral ayrışım).
+
+            ψ⁺ = ½λ⟨tr ε⟩₊² + µ(⟨ε_1⟩₊² + ⟨ε_2⟩₊²)
+
+        ⟨·⟩₊ Macaulay parantezidir. `StrainNeuron.energy_density_split`
+        aynı ayrışımı GERİLMEDEN başlayarak yapar; hangisi elde varsa o
+        kullanılır.
+
+        Not: küçük gerinimlerde (~1e-5) softplus gibi yumuşak yaklaşımlar
+        büyük bağıl hata verir; burada tam Macaulay parantezi (relu)
+        kullanılır.
+        """
+        tr_eps = eps_xx + eps_yy
+        ortalama = 0.5 * tr_eps
+        R = torch.sqrt(0.25 * (eps_xx - eps_yy) ** 2 + eps_xy ** 2 + eps)
+
+        e1_plus = torch.relu(ortalama + R)
+        e2_plus = torch.relu(ortalama - R)
+        tr_plus = torch.relu(tr_eps)
+
+        return 0.5 * lam * tr_plus ** 2 + mu * (e1_plus ** 2 + e2_plus ** 2)
+
+    # ------------------------------------------------------------- çözüm
+    def solve_damage(self, psi_plus: torch.Tensor,
+                     d_prev: torch.Tensor,
+                     history_H: Optional[torch.Tensor] = None,
+                     G_c: Optional[torch.Tensor] = None,
+                     mode: str = "at2",
+                     n_iter: int = 8,
+                     relax: float = 1.0,
+                     source_cap: Optional[float] = None,
+                     soft_clamp: bool = False,
+                     explain: bool = False,
+                     label: str = "") -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""
+        Hasar alanını bir adım ilerlet.
+
+        Args:
+            psi_plus: Çekme enerji yoğunluğu alanı ψ⁺.
+            d_prev: Önceki hasar alanı.
+            history_H: Tarihçe alanı; None ise ψ⁺ ile başlatılır.
+            G_c: Kırılma tokluğu; None ise modülün değeri (ters problemde
+                dışarıdan optimize edilen tensör buradan geçirilir).
+            mode: 'at2' (tam) veya 'linear' (α≡1).
+            n_iter: Sabit-nokta yineleme sayısı.
+            relax: Gevşetme katsayısı (0<relax≤1); 1 tam güncelleme.
+            source_cap: Kaynak terimine üst sınır (G_c çok küçükken
+                sayısal patlamayı önler).
+            soft_clamp: True ise [0,1] kısıtı sigmoid ile yumuşak uygulanır
+                (gradyan her yerde akar); False ise sert clamp.
+            explain: True ise adımlar yazdırılır.
+
+        Returns:
+            (d_yeni, H): güncel hasar alanı ve tarihçe.
+        """
+        if mode not in ("at2", "linear"):
+            raise ValueError("mode 'at2' veya 'linear' olmalı.")
+
+        gc = self.G_c if G_c is None else G_c
+        H_onceki = psi_plus if history_H is None else history_H
+        H = torch.max(H_onceki, psi_plus)          # tarihçe: geri dönüş yok
+
+        kaynak = 2.0 * self.ell * H / (gc + 1e-12)
+        if source_cap is not None:
+            kaynak = torch.clamp(kaynak, max=source_cap)
+
+        k2_ell = self.ell ** 2 * self.spectral_ops.k_squared
+
+        if mode == "at2":
+            alpha = 1.0 + kaynak                    # α = 1 + 2ℓH/G_c
+            alpha_ort = alpha.mean().detach()
+            payda = alpha_ort + k2_ell
+        else:
+            alpha = None
+            payda = 1.0 + k2_ell
+
+        d = d_prev.clone()
+        for _ in range(n_iter):
+            if mode == "at2":
+                # Sabit-nokta: uzayda değişen kısım sağ tarafa taşınır
+                rhs = kaynak + (alpha_ort - alpha) * d
+            else:
+                rhs = kaynak
+            d_cozum = safe_ifft2(safe_fft2(rhs) / payda).real
+
+            if soft_clamp:
+                # Sigmoid tabanlı yumuşak kısıt: gradyan her yerde akar
+                d_cozum = torch.sigmoid(10.0 * (d_cozum - 0.5)) * 0.98 + 0.01
+            else:
+                d_cozum = d_cozum.clamp(0.0, 1.0)
+
+            d = relax * d_cozum + (1.0 - relax) * d
+
+        # Geri dönüşsüzlük: hasar azalamaz
+        d = torch.max(d, d_prev)
+        if not soft_clamp:
+            d = d.clamp(0.0, 1.0)
+
+        if explain:
+            sep = "-" * 68
+            head = "  PhaseFieldNeuron — AT2 hasar adımı"
+            if label:
+                head += f" [{label}]"
+            gc_val = float(gc) if not torch.is_tensor(gc) else gc.item()
+            print(f"{sep}\n{head}\n{sep}")
+            print(f"    Karakteristik uzunluk ℓ = {self.ell:.4g} m, "
+                  f"G_c = {gc_val:.6g} J/m²")
+            print(f"    Form: {'tam AT2' if mode == 'at2' else 'lineerleştirilmiş'}"
+                  f"   |   {n_iter} sabit-nokta yinelemesi")
+            print(f"    Sürücü enerji: max ψ⁺ = {psi_plus.max().item():.6g} J/m³")
+            print(f"    Tarihçe:       max H  = {H.max().item():.6g} J/m³")
+            print(f"    Hasar: max d = {d.max().item():.6f}, "
+                  f"ortalama d = {d.mean().item():.6f}")
+            hasarli = (d > 0.5).to(d.dtype).mean().item()
+            print(f"    d > 0,5 olan alan oranı: %{hasarli*100:.3f}")
+            print(sep)
+
+        return d, H
+
+    def forward(self, psi_plus, d_prev, **kwargs):
+        """nn.Module arayüzü — solve_damage() sarmalayıcısı."""
+        return self.solve_damage(psi_plus, d_prev, **kwargs)
+
+    def extra_repr(self) -> str:
+        return (f"ell={self.ell:.3e}, G_c={float(self.G_c):.3e}, "
+                f"eta={self.eta:.1e}")
+
+
 class PlasticityNeuron(nn.Module):
     r"""
     J2 (von Mises) Plastisite Nöronu — radyal geri dönüş (return mapping).
@@ -2412,17 +2738,66 @@ class FatigueNeuron(nn.Module):
     def goodman_criterion(self, sigma_a: float, sigma_m: float) -> float:
         """
         Goodman kriteri (ortalama gerilme etkisi).
-        
+
         σa/S_e + σm/S_ut = 1/SF
-        
+
         Returns:
             SF: Güvenlik faktörü
         """
         denominator = sigma_a / self.S_e + sigma_m / self.S_ut
         if denominator <= 0:
             return float('inf')
-        
+
         return 1 / denominator
+
+    def goodman_corrected_amplitude(self, sigma_a: float,
+                                    sigma_m: float) -> float:
+        r"""
+        Goodman ortalama gerilme düzeltmesi — EŞDEĞER genlik.
+
+            σ_a,düzeltilmiş = σ_a / (1 - σ_m/S_ut)
+
+        `goodman_criterion` güvenlik katsayısı döndürür; bu metot ise
+        ortalama gerilmenin etkisini içeren eşdeğer bir genlik verir ve
+        doğrudan S-N eğrisine girilebilir. İkisi farklı sorulara cevaptır.
+
+        Fiziksel yorum:
+          σ_m > 0 (çeki)  → genlik artar, ömür kısalır
+          σ_m < 0 (bası)  → genlik azalır, ömür uzar
+          σ_m ≥ S_ut      → statik kopma; sonsuz genlik döndürülür
+        """
+        if sigma_m >= self.S_ut:
+            return float('inf')
+        payda = 1.0 - sigma_m / self.S_ut
+        if payda <= 0:
+            return float('inf')
+        return sigma_a / payda
+
+    def basquin_life(self, sigma_a: float,
+                     sigma_f_prime: float, b: float,
+                     min_cycles: float = 1.0) -> float:
+        r"""
+        Basquin bağıntısıyla ömür.
+
+            σ_a = σ_f'·(2N_f)^b   ⇒   N_f = ½·(σ_a/σ_f')^(1/b)
+
+        `cycles_to_failure` (N = C/σ_a^m) ile aynı fiziği farklı
+        parametrelendirir ve genelde FARKLI sonuç verir; hangisinin
+        kullanıldığı raporlanmalıdır.
+
+        Dayanım sınırı S_e altında sonsuz ömür varsayılır.
+
+        Args:
+            sigma_a: Gerilme genliği [Pa].
+            sigma_f_prime: Yorulma dayanım katsayısı σ_f' [Pa].
+            b: Basquin üsteli (negatif).
+            min_cycles: Döndürülecek en küçük çevrim sayısı.
+        """
+        if sigma_a <= 0 or sigma_a < self.S_e:
+            return float('inf')
+        oran = sigma_a / sigma_f_prime
+        N_f = (oran ** (1.0 / b)) / 2.0
+        return max(N_f, min_cycles)
     
     def forward(self, sigma_a: float, n_cycles: int = 1) -> Dict[str, float]:
         """
