@@ -149,6 +149,7 @@ __all__ = [
 
     # Ortak Plaka Kapalı Formları
     'plate_critical_load',
+    'kirsch_hole_stress',
 
     # Fizik-Bilen Nöronlar (2D - Temel)
     'BiharmonicNeuron',
@@ -162,6 +163,7 @@ __all__ = [
     'ModalNeuron',
     'CrackNeuron',
     'ThermalNeuron',
+    'PlasticityNeuron',
     'FatigueNeuron',
     'DynamicNeuron',
     'NonlinearNeuron',
@@ -554,6 +556,83 @@ def plate_critical_load(D: float, Lx: float, Ly: float,
         N_cr = N_cr_kirchhoff / (1 + N_cr_kirchhoff / (kappa_s * G * h))
 
     return N_cr, N_cr_kirchhoff
+
+
+def kirsch_hole_stress(sigma_0, X: torch.Tensor, Y: torch.Tensor,
+                       a_hole: float,
+                       cx: float = 0.0, cy: float = 0.0,
+                       mask_hole: bool = True,
+                       vm_eps: float = 1e-20
+                       ) -> Dict[str, torch.Tensor]:
+    r"""
+    Kirsch çözümü — sonsuz plakada dairesel delik etrafındaki gerilme alanı.
+
+    Tek eksenli (x yönü) σ₀ çekmesi altında, polar koordinatlarda:
+
+        σ_rr = (σ₀/2)[(1 - a²/r²) + (1 - 4a²/r² + 3a⁴/r⁴)·cos2θ]
+        σ_θθ = (σ₀/2)[(1 + a²/r²) - (1 + 3a⁴/r⁴)·cos2θ]
+        τ_rθ = -(σ₀/2)[(1 + 2a²/r² - 3a⁴/r⁴)·sin2θ]
+
+    Delik kenarında (r = a, θ = ±π/2) σ_θθ = 3σ₀ olur: klasik gerilme
+    yoğunlaşma katsayısı SCF = 3. Bu, çözümün kapalı-form sağlamasıdır.
+
+    Bütün girdiler tensör olabilir; ifade autograd-geçirgendir, dolayısıyla
+    ölçülen bir gerilme alanından σ₀ veya malzeme parametrelerini geri
+    çözmek mümkündür.
+
+    Args:
+        sigma_0: Uzak alan çekme gerilmesi [Pa] — skaler veya tensör.
+        X, Y: Koordinat gridleri [N, N].
+        a_hole: Delik yarıçapı [m].
+        cx, cy: Delik merkezi.
+        mask_hole: True ise delik içi sıfırlanır.
+        vm_eps: von Mises karekökü altına eklenen küçük sabit.
+
+    Returns:
+        dict: sigma_xx, sigma_yy, tau_xy, sigma_vm, hole_mask, r, theta
+    """
+    dx_g = X - cx
+    dy_g = Y - cy
+
+    r = torch.sqrt(dx_g ** 2 + dy_g ** 2)
+    theta = torch.atan2(dy_g, dx_g)
+
+    # Delik merkezinde r→0 tekilliği: yarıçapın %1'inde tabanlanır
+    r_safe = torch.clamp(r, min=a_hole * 0.01)
+    hole_mask = (r < a_hole)
+
+    ar2 = (a_hole / r_safe) ** 2
+    ar4 = ar2 ** 2
+    cos2t = torch.cos(2 * theta)
+    sin2t = torch.sin(2 * theta)
+
+    sigma_rr = (sigma_0 / 2) * ((1 - ar2) + (1 - 4 * ar2 + 3 * ar4) * cos2t)
+    sigma_tt = (sigma_0 / 2) * ((1 + ar2) - (1 + 3 * ar4) * cos2t)
+    tau_rt = -(sigma_0 / 2) * ((1 + 2 * ar2 - 3 * ar4) * sin2t)
+
+    # Polar → Kartezyen
+    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+    cos2, sin2 = cos_t ** 2, sin_t ** 2
+    sincos = sin_t * cos_t
+
+    sigma_xx = sigma_rr * cos2 + sigma_tt * sin2 - 2 * tau_rt * sincos
+    sigma_yy = sigma_rr * sin2 + sigma_tt * cos2 + 2 * tau_rt * sincos
+    tau_xy = (sigma_rr - sigma_tt) * sincos + tau_rt * (cos2 - sin2)
+
+    sigma_vm = torch.sqrt(sigma_xx ** 2 - sigma_xx * sigma_yy
+                          + sigma_yy ** 2 + 3 * tau_xy ** 2 + vm_eps)
+
+    if mask_hole:
+        disi = (~hole_mask).to(sigma_xx.dtype)
+        sigma_xx = sigma_xx * disi
+        sigma_yy = sigma_yy * disi
+        tau_xy = tau_xy * disi
+        sigma_vm = sigma_vm * disi
+
+    return {
+        'sigma_xx': sigma_xx, 'sigma_yy': sigma_yy, 'tau_xy': tau_xy,
+        'sigma_vm': sigma_vm, 'hole_mask': hole_mask, 'r': r, 'theta': theta,
+    }
 
 
 # =============================================================================
@@ -1039,6 +1118,43 @@ class StrainNeuron(nn.Module):
     def forward(self, w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Eğrilikleri hesapla."""
         return self.curvatures(w)
+
+    @staticmethod
+    def energy_density_split(sigma_xx: torch.Tensor, sigma_yy: torch.Tensor,
+                             tau_xy: torch.Tensor,
+                             E, nu, eps: float = 1e-20) -> torch.Tensor:
+        r"""
+        Çekme–basma ayrışımlı gerinim enerji yoğunluğu ψ⁺ (düzlem gerilme).
+
+        Faz-alanı hasar modellerinde çatlağı yalnız ÇEKME enerjisi sürer;
+        basma altında malzeme hasar almamalıdır. Bu yüzden asal gerinimlerin
+        pozitif kısmı alınır (spektral ayrışım):
+
+            σ_1,2 = (σ_xx+σ_yy)/2 ± √[((σ_xx-σ_yy)/2)² + τ_xy²]
+            ε_1 = (σ_1 - ν σ_2)/E ,   ε_2 = (σ_2 - ν σ_1)/E
+            ψ⁺ = (λ_2d/2)⟨ε_1+ε_2⟩₊² + µ(⟨ε_1⟩₊² + ⟨ε_2⟩₊²)
+
+        burada ⟨·⟩₊ = max(·, 0), λ_2d = Eν/(1-ν²), µ = E/[2(1+ν)].
+
+        E ve nu tensör olabilir; ifade autograd-geçirgendir.
+        """
+        lam_2d = E * nu / (1 - nu ** 2)
+        mu_val = E / (2 * (1 + nu))
+
+        sigma_avg = (sigma_xx + sigma_yy) / 2
+        R = torch.sqrt(((sigma_xx - sigma_yy) / 2) ** 2 + tau_xy ** 2 + eps)
+        sigma_1 = sigma_avg + R
+        sigma_2 = sigma_avg - R
+
+        eps_1 = (sigma_1 - nu * sigma_2) / E
+        eps_2 = (sigma_2 - nu * sigma_1) / E
+
+        eps_1_plus = torch.clamp(eps_1, min=0)
+        eps_2_plus = torch.clamp(eps_2, min=0)
+        eps_vol_plus = torch.clamp(eps_1 + eps_2, min=0)
+
+        return (lam_2d / 2) * eps_vol_plus ** 2 \
+            + mu_val * (eps_1_plus ** 2 + eps_2_plus ** 2)
 
 
 class BoundaryNeuron(nn.Module):
@@ -2029,6 +2145,146 @@ class ThermalNeuron(nn.Module):
     
     def extra_repr(self) -> str:
         return f"alpha={self.alpha:.2e}, E={self.E:.2e}"
+
+
+class PlasticityNeuron(nn.Module):
+    r"""
+    J2 (von Mises) Plastisite Nöronu — radyal geri dönüş (return mapping).
+
+    Elastik deneme (trial) gerilmesi akma yüzeyini aştığında, deviatörik
+    kısım yüzeye geri çekilir; hidrostatik kısım değişmez:
+
+        s   = σ - (tr σ/3)·I           (deviatörik)
+        σ_vm = √(σ_xx² - σ_xx σ_yy + σ_yy² + 3τ_xy²)
+        σ_vm > σ_y  ise   s ← s·(σ_y/σ_vm)     (radyal geri dönüş)
+
+    Bu, düzlem gerilme hâli için gradyan-dostu bir formdur: bölme işlemi
+    türevlenebilirdir, dolayısıyla akma gerilmesi σ_y ölçülen bir gerilme
+    alanından geri çözülebilir (ters problem).
+
+    Not: burada `sigma_y` bir TENSÖR olabilir ve ona göre türev alınabilir —
+    plastisitenin ters problemde kullanılabilmesinin sebebi budur.
+
+    Args:
+        sigma_y: Akma gerilmesi [Pa] (başlangıç değeri).
+        H_hard: Doğrusal pekleşme modülü [Pa]. Şu an akma yüzeyini
+            genişletmede kullanılmıyor; ileride kinematik/izotropik
+            pekleşme eklenmesi için saklanır.
+        learnable: True ise akma gerilmesi öğrenilebilir parametre olur.
+    """
+
+    def __init__(self, sigma_y: float, H_hard: float = 500e6,
+                 learnable: bool = False):
+        super().__init__()
+        self.H_hard = H_hard
+        if learnable:
+            self.sigma_y = nn.Parameter(torch.tensor(float(sigma_y)))
+        else:
+            self.register_buffer('sigma_y', torch.tensor(float(sigma_y)))
+
+    @staticmethod
+    def von_mises_2d(sigma_xx, sigma_yy, tau_xy, eps: float = 1e-20):
+        """Düzlem gerilme von Mises eşdeğeri."""
+        return torch.sqrt(sigma_xx ** 2 - sigma_xx * sigma_yy
+                          + sigma_yy ** 2 + 3 * tau_xy ** 2 + eps)
+
+    def return_map(self, sigma_xx: torch.Tensor, sigma_yy: torch.Tensor,
+                   tau_xy: torch.Tensor,
+                   sigma_y: Optional[torch.Tensor] = None,
+                   mode: str = "radial",
+                   explain: bool = False,
+                   label: str = "") -> Dict[str, torch.Tensor]:
+        r"""
+        Elastik deneme gerilmesini akma yüzeyine geri çek.
+
+        İki mod vardır ve farkları önemlidir:
+
+        • mode='radial' (VARSAYILAN): gerilme tensörünün tamamı σ_y/σ_vm ile
+          ölçeklenir. von Mises ölçüsü gerilmede 1. dereceden homojen
+          olduğundan sonuç TAM olarak akma yüzeyine oturur: σ_vm = σ_y.
+
+        • mode='deviatoric': hidrostatik kısım korunup yalnız deviatörik kısım
+          ölçeklenir. Bu, üç boyutlu J2'nin standart adımıdır; ancak DÜZLEM
+          GERİLME hâlinde (σ_zz = 0) hidrostatik terim (σ_xx+σ_yy)/3 ile
+          alındığında σ_zz kısıtı gözardı edildiği için sonuç akma yüzeyinin
+          DIŞINDA kalır. Örneğin saf çekmede σ_y = 300 MPa iken 500 MPa'lık
+          deneme gerilmesi 338 MPa'ya iner — yüzeyi %12,8 aşar.
+
+        Düzlem gerilmenin tam doğru geri dönüşü σ_zz = 0 kısıtı altında
+        iteratif çözüm ister; 'radial' bunun akma yüzeyine oturan, kapalı
+        formda ve türevlenebilir bir yaklaşımıdır. 'deviatoric' seçeneği,
+        bu formu kullanan mevcut çalışmalarla birebir karşılaştırma
+        yapılabilsin diye korunmuştur.
+
+        Args:
+            sigma_xx, sigma_yy, tau_xy: Elastik deneme gerilmeleri.
+            sigma_y: Akma gerilmesi; None ise modülün kendi değeri kullanılır
+                (ters problemde dışarıdan optimize edilen tensör buradan
+                geçirilir).
+            mode: 'radial' veya 'deviatoric'.
+            explain: True ise adımlar sayısal değerleriyle yazdırılır.
+
+        Returns:
+            dict: sigma_xx, sigma_yy, tau_xy (düzeltilmiş), sigma_vm_trial,
+                  sigma_vm, yield_ratio, plastic_fraction
+        """
+        if mode not in ("radial", "deviatoric"):
+            raise ValueError("mode 'radial' veya 'deviatoric' olmalı.")
+
+        sy = self.sigma_y if sigma_y is None else sigma_y
+
+        vm_trial = self.von_mises_2d(sigma_xx, sigma_yy, tau_xy)
+        yield_ratio = vm_trial / (sy + 1e-10)
+
+        # Akan noktalarda ölçek σ_y/σ_vm, kalanlarda 1 — her iki dalda da
+        # türevlenebilir
+        olcek = torch.where(vm_trial > sy,
+                            sy / (vm_trial + 1e-20),
+                            torch.ones_like(vm_trial))
+
+        if mode == "radial":
+            sxx_c = sigma_xx * olcek
+            syy_c = sigma_yy * olcek
+            txy_c = tau_xy * olcek
+        else:
+            sigma_h = (sigma_xx + sigma_yy) / 3.0
+            sxx_c = (sigma_xx - sigma_h) * olcek + sigma_h
+            syy_c = (sigma_yy - sigma_h) * olcek + sigma_h
+            txy_c = tau_xy * olcek
+
+        vm_c = self.von_mises_2d(sxx_c, syy_c, txy_c)
+        plastik_oran = (vm_trial > sy).to(vm_trial.dtype).mean()
+
+        if explain:
+            sep = "-" * 68
+            head = "  PlasticityNeuron — J2 radyal geri dönüş"
+            if label:
+                head += f" [{label}]"
+            print(f"{sep}\n{head}\n{sep}")
+            sy_val = float(sy) if not torch.is_tensor(sy) else sy.item()
+            print(f"    Akma gerilmesi σ_y = {sy_val/1e6:.4g} MPa")
+            print(f"    Elastik deneme: max σ_vm = "
+                  f"{vm_trial.max().item()/1e6:.6g} MPa")
+            print(f"    Akma oranı σ_vm/σ_y: max = {yield_ratio.max().item():.4f}")
+            print(f"    Akan düğüm oranı: %{plastik_oran.item()*100:.2f}")
+            print(f"    Geri dönüş sonrası: max σ_vm = "
+                  f"{vm_c.max().item()/1e6:.6g} MPa"
+                  f"   (akma yüzeyine oturdu)")
+            print(sep)
+
+        return {
+            'sigma_xx': sxx_c, 'sigma_yy': syy_c, 'tau_xy': txy_c,
+            'sigma_vm_trial': vm_trial, 'sigma_vm': vm_c,
+            'yield_ratio': yield_ratio, 'plastic_fraction': plastik_oran,
+        }
+
+    def forward(self, sigma_xx, sigma_yy, tau_xy, **kwargs):
+        """nn.Module arayüzü — return_map() sarmalayıcısı."""
+        return self.return_map(sigma_xx, sigma_yy, tau_xy, **kwargs)
+
+    def extra_repr(self) -> str:
+        sy = self.sigma_y
+        return f"sigma_y={float(sy):.3e}, H={self.H_hard:.3e}"
 
 
 class FatigueNeuron(nn.Module):
