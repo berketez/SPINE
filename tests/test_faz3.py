@@ -132,14 +132,38 @@ def test_thermal():
     N_T = neuron.thermal_membrane_force(dT)
     assert abs(N_T - sigma * STEEL.h) / abs(sigma * STEEL.h) < 1e-9
 
-    # Kritik termal burkulma: N_T(ΔT_cr) büyüklüğü N_cr'ye eşit olmalı
-    dT_cr = neuron.critical_thermal_buckling(m=1, n=1)
+    # Kritik termal burkulma: N_T(ΔT_cr) büyüklüğü N_cr'ye eşit olmalı.
+    # VARSAYILAN biaxial'dir: düzlem içinde tam kısıtlı bir plaka ısındığında
+    # her iki yönde de genleşemez → N_x = N_y = N_T. Kritik yükü uniaxial
+    # formülüyle almak (eski davranış) ΔT_cr'yi kare plakada 2 kat fazla,
+    # yani güvensiz yönde verir.
     tx = (math.pi / Lx) ** 2
     ty = (math.pi / Ly) ** 2
-    N_cr = STEEL.D * (tx + ty) ** 2 / tx
+
+    dT_cr = neuron.critical_thermal_buckling(m=1, n=1)          # biaxial
+    N_cr_bi = STEEL.D * (tx + ty)
     N_at_crit = abs(neuron.thermal_membrane_force(dT_cr))
-    assert abs(N_at_crit - N_cr) / N_cr < 1e-9, \
-        f"ΔT_cr'de |N_T|={N_at_crit:.4e} ≠ N_cr={N_cr:.4e}"
+    assert abs(N_at_crit - N_cr_bi) / N_cr_bi < 1e-9, \
+        f"biaxial ΔT_cr'de |N_T|={N_at_crit:.4e} ≠ N_cr={N_cr_bi:.4e}"
+
+    # Uniaxial seçeneği açıkça istendiğinde eski kapalı formu vermeli
+    dT_cr_uni = neuron.critical_thermal_buckling(m=1, n=1, loading="uniaxial")
+    N_cr_uni = STEEL.D * (tx + ty) ** 2 / tx
+    N_at_crit_uni = abs(neuron.thermal_membrane_force(dT_cr_uni))
+    assert abs(N_at_crit_uni - N_cr_uni) / N_cr_uni < 1e-9, \
+        f"uniaxial ΔT_cr'de |N_T|={N_at_crit_uni:.4e} ≠ N_cr={N_cr_uni:.4e}"
+
+    # Kare plakada uniaxial kritik yük biaxial'in tam 2 katıdır
+    assert abs(dT_cr_uni / dT_cr - 2.0) < 1e-9, \
+        f"kare plakada ΔT_cr(uni)/ΔT_cr(bi) = {dT_cr_uni/dT_cr:.6f}, 2.0 bekleniyordu"
+
+    # forward() zinciri: ε_T → σ_T → N_T → N_cr → SF tutarlı olmalı
+    res = neuron(dT, max_mode=3)
+    assert abs(res["eps_T"] - alpha * dT) / (alpha * dT) < 1e-9
+    assert abs(res["N_T"] - N_T) / abs(N_T) < 1e-9
+    assert abs(res["SF_thermal"] - res["N_cr"] / abs(res["N_T"])) < 1e-9
+    # Kare plakada en kritik mod (1,1) olmalı
+    assert (res["m"], res["n"]) == (1, 1)
 
     # Termal eğrilik: κ = αΔT/h
     kappa = neuron.thermal_curvature(T_top=80.0, T_bottom=20.0)

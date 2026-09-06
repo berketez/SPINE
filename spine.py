@@ -147,6 +147,9 @@ __all__ = [
     # Spektral Operatörler (3D)
     'SpectralOps3D',
 
+    # Ortak Plaka Kapalı Formları
+    'plate_critical_load',
+
     # Fizik-Bilen Nöronlar (2D - Temel)
     'BiharmonicNeuron',
     'BucklingNeuron',
@@ -498,6 +501,62 @@ class SineBasis(nn.Module):
 
 
 # =============================================================================
+# ORTAK PLAKA KAPALI FORMLARI
+# =============================================================================
+
+def plate_critical_load(D: float, Lx: float, Ly: float,
+                        m: int = 1, n: int = 1,
+                        loading: str = "uniaxial",
+                        direction: str = "x",
+                        mindlin: bool = False,
+                        E: Optional[float] = None,
+                        nu: Optional[float] = None,
+                        h: Optional[float] = None) -> Tuple[float, float]:
+    r"""
+    Dört kenarı basit mesnetli plakanın kritik burkulma yükü (kapalı form).
+
+    w = sin(mπx/Lx)·sin(nπy/Ly) burkulma denklemine konursa
+    (α_m = mπ/Lx, α_n = nπ/Ly):
+
+        D(α_m² + α_n²)² = N_x·α_m² + N_y·α_n²
+
+    - uniaxial, x yönü (N_y=0):  N_cr = D(α_m²+α_n²)²/α_m²
+    - uniaxial, y yönü (N_x=0):  N_cr = D(α_m²+α_n²)²/α_n²
+    - biaxial (N_x=N_y=N):       N_cr = D(α_m²+α_n²)
+
+    Bu fonksiyon `BucklingNeuron` ve `ThermalNeuron` tarafından ORTAK
+    kullanılır; formülün ikinci bir kopyası tutulmaz.
+
+    Returns:
+        (N_cr, N_cr_kirchhoff): Mindlin kapalıysa ikisi eşittir.
+    """
+    if loading not in ("uniaxial", "biaxial"):
+        raise ValueError("loading 'uniaxial' veya 'biaxial' olmalı.")
+    if direction not in ("x", "y"):
+        raise ValueError("direction 'x' veya 'y' olmalı.")
+
+    term_x = (m * math.pi / Lx) ** 2
+    term_y = (n * math.pi / Ly) ** 2
+    s = term_x + term_y
+
+    if loading == "uniaxial":
+        denom = term_x if direction == "x" else term_y
+        N_cr_kirchhoff = D * (s ** 2) / denom
+    else:
+        N_cr_kirchhoff = D * s
+
+    N_cr = N_cr_kirchhoff
+    if mindlin:
+        if E is None or nu is None or h is None:
+            raise ValueError("mindlin=True için E, nu ve h verilmeli.")
+        G = E / (2 * (1 + nu))
+        kappa_s = 5.0 / 6.0
+        N_cr = N_cr_kirchhoff / (1 + N_cr_kirchhoff / (kappa_s * G * h))
+
+    return N_cr, N_cr_kirchhoff
+
+
+# =============================================================================
 # FİZİK-BİLEN NÖRONLAR
 # =============================================================================
 
@@ -582,17 +641,85 @@ class BucklingNeuron(nn.Module):
         # Öğrenilebilir parametreler
         self.load_scale = nn.Parameter(torch.ones(1))
 
-    def analytical_critical_load(self, m: int = 1, n: int = 1) -> float:
-        """
-        Analitik kritik yük (basit mesnetli).
+    def analytical_critical_load(self, m: int = 1, n: int = 1,
+                                 loading: str = "uniaxial",
+                                 direction: str = "x",
+                                 mindlin: bool = False,
+                                 explain: bool = False,
+                                 label: str = "") -> float:
+        r"""
+        Analitik kritik burkulma yükü (dört kenarı basit mesnetli plaka).
 
-        Ncr = D·[(mπ/L)² + (nπ/W)²]² / (mπ/L)²
-        """
-        term_x = (m * math.pi / self.Lx) ** 2
-        term_y = (n * math.pi / self.Ly) ** 2
+        Kirchhoff-Love burkulma denkleminden, w = sin(mπx/Lx)·sin(nπy/Ly)
+        yerine konarak (α_m = mπ/Lx, α_n = nπ/Ly):
 
-        N_cr = self.D * ((term_x + term_y) ** 2) / term_x
+            D(α_m² + α_n²)² = N_x·α_m² + N_y·α_n²
+
+        Yükleme durumuna göre:
+          - uniaxial (N_y = 0, yük x yönünde):  N_cr = D(α_m²+α_n²)² / α_m²
+          - uniaxial (N_x = 0, yük y yönünde):  N_cr = D(α_m²+α_n²)² / α_n²
+          - biaxial  (N_x = N_y = N):          N_cr = D(α_m²+α_n²)
+
+        Biaxial hal, tam kısıtlı bir plakada TERMAL bası için doğru olandır:
+        ısınan plaka her iki yönde de genleşmeye zorlanır, dolayısıyla
+        N_x = N_y = N_T oluşur. Kare plakada biaxial kritik yük uniaxial'in
+        yarısıdır; uniaxial formülü termal probleme uygulamak kritik yükü
+        (ve dolayısıyla ΔT_cr'yi) güvensiz yönde ~2 kat fazla tahmin eder.
+
+        Args:
+            m, n: Burkulma mod numaraları (x ve y yönünde yarım dalga sayısı).
+            loading: 'uniaxial' (tek eksenli) veya 'biaxial' (iki eksenli).
+            direction: uniaxial halde yükün yönü — 'x' veya 'y'.
+            mindlin: True ise enine kayma esnekliği (Mindlin-Reissner)
+                düzeltmesi uygulanır: N_cr ← N_cr/(1 + N_cr/(κ_s·G·h)).
+                Kalın plakalarda kritik yükü düşürür.
+            explain: True ise her ara adım sayısal değerleriyle yazdırılır.
+            label: explain çıktısında problemi etiketler.
+
+        Returns:
+            N_cr: Kritik burkulma yükü [N/m] (birim genişlik başına kuvvet).
+        """
+        term_x = (m * math.pi / self.Lx) ** 2   # α_m²
+        term_y = (n * math.pi / self.Ly) ** 2   # α_n²
+
+        N_cr, N_cr_kirchhoff = plate_critical_load(
+            self.D, self.Lx, self.Ly, m=m, n=n,
+            loading=loading, direction=direction, mindlin=mindlin,
+            E=self.material.E, nu=self.material.nu, h=self.material.h)
+
+        if explain:
+            self._explain_critical_load(label, m, n, loading, direction, mindlin,
+                                        term_x, term_y, N_cr_kirchhoff, N_cr)
         return N_cr
+
+    def _explain_critical_load(self, label, m, n, loading, direction, mindlin,
+                               term_x, term_y, N_cr_kirchhoff, N_cr):
+        """Kritik yük hesabını adım adım yazdır (şeffaf mod)."""
+        sep = "-" * 68
+        head = "  BucklingNeuron — kritik yük"
+        if label:
+            head += f" [{label}]"
+        print(f"{sep}\n{head}\n{sep}")
+        print(f"    Plaka: Lx = {self.Lx:.4g} m, Ly = {self.Ly:.4g} m, "
+              f"h = {self.material.h:.4g} m")
+        print(f"    Eğilme rijitliği  D = E·h³/[12(1-ν²)] = {self.D:.6g} N·m")
+        print(f"    Mod (m,n) = ({m},{n})")
+        print(f"      α_m² = (mπ/Lx)² = {term_x:.6g} 1/m²")
+        print(f"      α_n² = (nπ/Ly)² = {term_y:.6g} 1/m²")
+        if loading == "uniaxial":
+            d = "α_m²" if direction == "x" else "α_n²"
+            print(f"    Yükleme: tek eksenli ({direction} yönünde)")
+            print(f"      N_cr = D(α_m²+α_n²)²/{d} = {N_cr_kirchhoff:.6g} N/m")
+        else:
+            print(f"    Yükleme: iki eksenli (N_x = N_y)")
+            print(f"      N_cr = D(α_m²+α_n²) = {N_cr_kirchhoff:.6g} N/m")
+        if mindlin:
+            G = self.material.E / (2 * (1 + self.material.nu))
+            print(f"    Mindlin kayma düzeltmesi (κ_s=5/6, G={G:.4g} Pa):")
+            print(f"      N_cr ← N_cr/(1+N_cr/(κ_s·G·h)) = {N_cr:.6g} N/m"
+                  f"   (düşüş %{100*(1-N_cr/N_cr_kirchhoff):.3f})")
+        print(f"    → N_cr = {N_cr:.6g} N/m  ({N_cr/1e3:.4g} kN/m)")
+        print(sep)
 
     def mode_shape(self, m: int = 1, n: int = 1) -> torch.Tensor:
         """
@@ -663,21 +790,58 @@ class BucklingNeuron(nn.Module):
 
         return residual
 
-    def find_critical_modes(self, max_m: int = 5, max_n: int = 5) -> List[Dict]:
+    def find_critical_modes(self, max_m: int = 5, max_n: int = 5,
+                            loading: str = "uniaxial",
+                            direction: str = "x",
+                            mindlin: bool = False,
+                            explain: bool = False,
+                            label: str = "",
+                            top_k: int = 5) -> List[Dict]:
         """
-        Kritik modları bul ve sırala.
+        (m,n) mod uzayını tara, kritik yükleri küçükten büyüğe sırala.
+
+        Burkulma en düşük N_cr'yi veren modda başlar; bu yüzden tarama
+        yapılmadan (m,n)=(1,1) varsaymak dikdörtgen plakalarda yanıltıcıdır.
+
+        Args:
+            max_m, max_n: Taranacak en büyük mod numaraları.
+            loading, direction, mindlin: `analytical_critical_load` ile aynı.
+            explain: True ise en düşük `top_k` mod tablo hâlinde yazdırılır.
+            top_k: explain çıktısında gösterilecek mod sayısı.
+
+        Returns:
+            [{'m':…, 'n':…, 'N_cr':…}, …] — N_cr'ye göre artan sırada.
         """
         modes = []
         for m in range(1, max_m + 1):
             for n in range(1, max_n + 1):
-                N_cr = self.analytical_critical_load(m, n)
-                modes.append({
-                    'm': m,
-                    'n': n,
-                    'N_cr': N_cr
-                })
+                N_cr = self.analytical_critical_load(
+                    m, n, loading=loading, direction=direction, mindlin=mindlin)
+                modes.append({'m': m, 'n': n, 'N_cr': N_cr})
 
         modes.sort(key=lambda x: x['N_cr'])
+
+        if explain:
+            sep = "-" * 68
+            head = "  BucklingNeuron — mod taraması"
+            if label:
+                head += f" [{label}]"
+            kind = (f"tek eksenli ({direction})" if loading == "uniaxial"
+                    else "iki eksenli")
+            print(f"{sep}\n{head}\n{sep}")
+            print(f"    Yükleme: {kind}"
+                  f"{' + Mindlin düzeltmesi' if mindlin else ''}"
+                  f"   |   taranan mod: {max_m}×{max_n}")
+            print(f"    {'sıra':>4}  {'m':>2} {'n':>2}   {'N_cr [kN/m]':>14}   oran")
+            best = modes[0]['N_cr']
+            for i, md in enumerate(modes[:top_k], start=1):
+                mark = "  ← kritik mod" if i == 1 else ""
+                print(f"    {i:>4}  {md['m']:>2} {md['n']:>2}   "
+                      f"{md['N_cr']/1e3:>14.4f}   {md['N_cr']/best:>5.3f}×{mark}")
+            print(f"    → burkulma modu (m,n) = ({modes[0]['m']},{modes[0]['n']}), "
+                  f"N_cr = {best:.6g} N/m")
+            print(sep)
+
         return modes
 
     def extra_repr(self) -> str:
@@ -733,6 +897,105 @@ class StressNeuron(nn.Module):
         sigma_xy = G * gamma_xy
 
         return sigma_xx, sigma_yy, sigma_xy
+
+    @staticmethod
+    def surface_strain(kappa_xx: torch.Tensor, kappa_yy: torch.Tensor,
+                       kappa_xy: torch.Tensor, z: float
+                       ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""
+        Kirchhoff varsayımıyla eğrilikten z kotundaki yüzey şekil değiştirmesi.
+
+            ε_xx = z·κ_xx,   ε_yy = z·κ_yy,   γ_xy = 2z·κ_xy
+
+        γ_xy'deki 2 çarpanı mühendislik kayma şekil değiştirmesi tanımından
+        gelir (γ = 2ε_xy) ve κ_xy = -∂²w/∂x∂y konvansiyonuyla uyumludur.
+
+        Args:
+            kappa_xx, kappa_yy, kappa_xy: Eğrilikler.
+            z: Kalınlık boyunca kot; üst yüzey için +h/2, alt yüzey için -h/2.
+        """
+        return z * kappa_xx, z * kappa_yy, 2 * z * kappa_xy
+
+    @staticmethod
+    def von_mises_2d(sigma_xx: torch.Tensor, sigma_yy: torch.Tensor,
+                     sigma_xy: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+        r"""
+        Düzlem gerilme hâli için von Mises eşdeğer gerilmesi.
+
+            σ_vm = √(σ_xx² - σ_xx·σ_yy + σ_yy² + 3σ_xy²)
+
+        Args:
+            eps: Karekök altına eklenen küçük sabit (gradyan güvenliği için;
+                varsayılan 0 — tam analitik değer).
+        """
+        return torch.sqrt(sigma_xx**2 - sigma_xx * sigma_yy
+                          + sigma_yy**2 + 3 * sigma_xy**2 + eps)
+
+    def plate_surface_stress(self, kappa_xx: torch.Tensor,
+                             kappa_yy: torch.Tensor,
+                             kappa_xy: torch.Tensor,
+                             z: float,
+                             membrane_xx: float = 0.0,
+                             membrane_yy: float = 0.0,
+                             vm_eps: float = 0.0,
+                             explain: bool = False,
+                             label: str = "") -> Dict[str, torch.Tensor]:
+        r"""
+        Plaka yüzeyindeki toplam gerilme: eğilme + düzlem içi (membran).
+
+            ε = z·κ  →  σ_eğilme = C(ε + ν·ε_çapraz)  →  σ = σ_eğilme + σ_membran
+
+        Membran katkısı doğrudan gerilme olarak verilir (Pa). Kuvvet/birim
+        uzunluk cinsinden bir N biliniyorsa membran gerilmesi N/h'dir; BASI
+        için işaret negatiftir.
+
+        Args:
+            kappa_xx, kappa_yy, kappa_xy: Eğrilik alanları.
+            z: Yüzey kotu (üst yüzey +h/2).
+            membrane_xx, membrane_yy: Düzlem içi gerilme katkıları [Pa].
+            vm_eps: von Mises karekökü için küçük sabit.
+            explain: True ise adımlar sayısal değerleriyle yazdırılır.
+            label: explain çıktısı için etiket.
+
+        Returns:
+            dict: eps_xx, eps_yy, gamma_xy, sigma_xx, sigma_yy, sigma_xy,
+                  sigma_vm
+        """
+        eps_xx, eps_yy, gamma_xy = self.surface_strain(
+            kappa_xx, kappa_yy, kappa_xy, z)
+        s_xx_b, s_yy_b, s_xy = self.forward(eps_xx, eps_yy, gamma_xy)
+
+        sigma_xx = s_xx_b + membrane_xx
+        sigma_yy = s_yy_b + membrane_yy
+        sigma_vm = self.von_mises_2d(sigma_xx, sigma_yy, s_xy, eps=vm_eps)
+
+        out = {
+            'eps_xx': eps_xx, 'eps_yy': eps_yy, 'gamma_xy': gamma_xy,
+            'sigma_xx': sigma_xx, 'sigma_yy': sigma_yy, 'sigma_xy': s_xy,
+            'sigma_bend_xx': s_xx_b, 'sigma_bend_yy': s_yy_b,
+            'sigma_vm': sigma_vm,
+        }
+
+        if explain:
+            sep = "-" * 68
+            head = "  StressNeuron — yüzey gerilmesi (Hooke, düzlem gerilme)"
+            if label:
+                head += f" [{label}]"
+            print(f"{sep}\n{head}\n{sep}")
+            print(f"    Kot z = {z:.4g} m   |   E = {self.E:.4g} Pa, ν = {self.nu:.4g}")
+            print(f"    ε = z·κ  →  max|ε_xx| = {eps_xx.abs().max().item():.6g}, "
+                  f"max|ε_yy| = {eps_yy.abs().max().item():.6g}")
+            print(f"    Eğilme: σ = C(ε + ν·ε_çapraz), C = E/(1-ν²) = "
+                  f"{self.E/(1-self.nu**2):.6g} Pa")
+            print(f"      max|σ_eğilme,xx| = {s_xx_b.abs().max().item()/1e6:.6g} MPa, "
+                  f"max|σ_eğilme,yy| = {s_yy_b.abs().max().item()/1e6:.6g} MPa")
+            print(f"    Membran katkısı: σ_xx += {membrane_xx/1e6:.6g} MPa, "
+                  f"σ_yy += {membrane_yy/1e6:.6g} MPa")
+            print(f"    von Mises: σ_vm = √(σ_xx²-σ_xx σ_yy+σ_yy²+3σ_xy²)")
+            print(f"      → max σ_vm = {sigma_vm.max().item()/1e6:.6g} MPa")
+            print(sep)
+
+        return out
 
     def extra_repr(self) -> str:
         return f"E={self.E:.2e}, nu={self.nu}"
@@ -880,33 +1143,198 @@ class StaticNeuron(nn.Module):
     def __init__(self, resolution: int, Lx: float, Ly: float,
                  material: MaterialProperties,
                  spectral_ops: Optional[SpectralOps2DStruct] = None,
-                 n_modes: int = 20):
+                 n_modes: int = 20,
+                 dtype: torch.dtype = torch.float32):
         super().__init__()
-        
+
         self.resolution = resolution
         self.Lx = Lx
         self.Ly = Ly
         self.material = material
         self.D = material.D
         self.n_modes = n_modes
-        
+        self.dtype = dtype
+
         self.spectral_ops = spectral_ops if spectral_ops else \
                            SpectralOps2DStruct(resolution, Lx, Ly)
-        
-        # Grid
-        x = torch.linspace(0, Lx, resolution)
-        y = torch.linspace(0, Ly, resolution)
+
+        # Grid — dtype burada belirlenir. Sonradan .double() çağırmak grid'i
+        # yükseltir ama KAYBOLAN HASSASİYETİ GERİ GETİRMEZ: float32'de üretilmiş
+        # bir konum float64'e çevrilince ~1e-7 göreli hatasını korur. Bu hata
+        # ikinci türev karşılaştırmalarında dx² ile bölündüğü için büyür.
+        # Hassas iş için modülü doğrudan dtype=torch.float64 ile kurun.
+        x = torch.linspace(0, Lx, resolution, dtype=dtype)
+        y = torch.linspace(0, Ly, resolution, dtype=dtype)
         X, Y = torch.meshgrid(x, y, indexing='ij')
         self.register_buffer('X', X)
         self.register_buffer('Y', Y)
-        
+
         # Öğrenilebilir parametre
-        self.stiffness_modulator = nn.Parameter(torch.ones(1))
+        self.stiffness_modulator = nn.Parameter(torch.ones(1, dtype=dtype))
     
+    def solve_navier(self, q: float,
+                     N_x: float = 0.0, N_y: float = 0.0,
+                     mindlin: bool = False,
+                     pdelta_mindlin: bool = False,
+                     n_modes: Optional[int] = None,
+                     max_amplification: float = 50.0,
+                     ratio_cap: float = 0.99,
+                     stiffness_scale: Optional[torch.Tensor] = None,
+                     explain: bool = False,
+                     label: str = "") -> Dict[str, torch.Tensor]:
+        r"""
+        Membran basısı altındaki basit mesnetli plakanın Navier çözümü —
+        deplasman VE eğrilikler analitik türevle (FFT yok, Gibbs yok).
+
+        Uniform q yükü için (m,n tek):
+
+            q_mn = 16q/(π²mn),    W₀ = q_mn / [D(α_m²+α_n²)²]
+
+        Düzlem içi bası, eğilme deplasmanını büyütür (P-Δ etkisi). Mod
+        bazında büyütme çarpanı:
+
+            r_mn = (N_x·α_m² + N_y·α_n²) / [D(α_m²+α_n²)²]
+            amp  = 1/(1 - r_mn)        (r_mn → 1 iken burkulma)
+
+        r_mn'in paydası ilgili modun kritik yüküdür; tek eksenli yükte
+        r_mn = N/N_cr,mn, iki eksenli yükte r_mn = N/(D(α_m²+α_n²)) olur —
+        yani aynı ifade her iki yükleme tipini de kapsar.
+
+        `mindlin=True` ise enine kayma esnekliğinden gelen ek deplasman
+        çarpanı uygulanır: 1 + (α_m²+α_n²)·D/(κ_s·G·h).
+
+        Args:
+            q: Uniform dağıtılmış yük [Pa] (örn. öz-ağırlık ρgh).
+            N_x, N_y: Düzlem içi BASI kuvvetleri [N/m] (pozitif = bası).
+            mindlin: Deplasman büyütmesinde kayma esnekliği çarpanı
+                uygulansın mı.
+            pdelta_mindlin: P-Δ oranının paydasındaki kritik yüke de Mindlin
+                düzeltmesi uygulansın mı. Kalın plakada kayma esnekliği
+                kritik yükü düşürür, dolayısıyla r = N/N_cr'yi büyütür;
+                False ise payda ince-plaka (Kirchhoff) kritik yüküdür.
+            n_modes: Seri mod sayısı (None → self.n_modes).
+            max_amplification: r_mn ≥ 1 olduğunda (burkulmuş mod) kullanılan
+                sonlu büyütme tavanı — çözüm ıraksamasın diye.
+            ratio_cap: r_mn için üst kırpma (varsayılan 0.99).
+            stiffness_scale: Rijitliği çarpan opsiyonel tensör. Verilmezse
+                modülün kendi `stiffness_modulator` parametresi kullanılır.
+                Ters problemde dışarıdan optimize edilen bir değişkeni
+                buradan geçirin — `stiffness_modulator`'ı yeni bir
+                nn.Parameter ile değiştirmek gradyan zincirini koparır.
+            explain: True ise adımlar sayısal değerleriyle yazdırılır.
+            label: explain çıktısı için etiket.
+
+        Returns:
+            dict: w, w_xx, w_yy, w_xy, kappa_xx, kappa_yy, kappa_xy,
+                  w_max, r_max (en büyük mod bası oranı), buckled (bool)
+        """
+        n_modes = self.n_modes if n_modes is None else n_modes
+        # D bir TENSÖRDÜR: rijitlik çarpanı üzerinden gradyan akar, böylece
+        # ölçülen bir alandan rijitliği (dolayısıyla E'yi) geri çözmek için
+        # autograd kullanılabilir. Skalara çevirmek ters problemi imkânsız kılar.
+        # `stiffness_scale` verilirse modülatör yerine o kullanılır; dışarıdan
+        # optimize edilen bir tensör geçirmenin doğru yolu budur (modülatörü
+        # nn.Parameter ile değiştirmek gradyan geçmişini KOPARIR).
+        olcek = (self.stiffness_modulator.squeeze() if stiffness_scale is None
+                 else stiffness_scale)
+        D = self.D * olcek
+        E, nu, h = self.material.E, self.material.nu, self.material.h
+        G = E / (2 * (1 + nu))
+        kappa_s = 5.0 / 6.0
+
+        X, Y = self.X, self.Y
+        w = torch.zeros_like(X)
+        w_xx = torch.zeros_like(X)
+        w_yy = torch.zeros_like(X)
+        w_xy = torch.zeros_like(X)
+
+        r_max = 0.0
+        n_terms = 0
+        for m in range(1, n_modes + 1, 2):        # uniform yükte yalnız tek modlar
+            for n in range(1, n_modes + 1, 2):
+                alpha_m = m * math.pi / self.Lx
+                alpha_n = n * math.pi / self.Ly
+                s = alpha_m ** 2 + alpha_n ** 2
+
+                q_mn = 16.0 * q / (math.pi ** 2 * m * n)
+                W0 = q_mn / (D * s ** 2)
+
+                # P-Δ: modun kritik yüküne oranı (D tensör olduğu için r de
+                # tensördür; karşılaştırmalar .item() ile yapılır ama büyütme
+                # çarpanı torch işlemleriyle kurulur, böylece gradyan korunur)
+                r_mn = (N_x * alpha_m ** 2 + N_y * alpha_n ** 2) / (D * s ** 2)
+                if pdelta_mindlin and r_mn.detach().item() > 0.0:
+                    # Yük vektörü yönündeki kritik büyüklük ve onun Mindlin
+                    # düzeltmesi:  N_cr ← N_cr/(1+N_cr/(κ_s·G·h))
+                    #   ⇒  r ← r·(1 + N_cr/(κ_s·G·h))
+                    N_mag = max(abs(N_x), abs(N_y))
+                    N_cr_mn = N_mag / r_mn
+                    r_mn = r_mn * (1.0 + N_cr_mn / (kappa_s * G * h))
+                r_mn_val = r_mn.detach().item()
+                r_max = max(r_max, r_mn_val)
+                if r_mn_val < 1.0:
+                    amp = 1.0 / (1.0 - torch.clamp(r_mn, max=ratio_cap))
+                else:
+                    amp = max_amplification
+
+                shear = 1.0 + s * D / (kappa_s * G * h) if mindlin else 1.0
+                W = W0 * amp * shear
+
+                sm = torch.sin(alpha_m * X)
+                sn = torch.sin(alpha_n * Y)
+                cm = torch.cos(alpha_m * X)
+                cn = torch.cos(alpha_n * Y)
+
+                w = w + W * sm * sn
+                w_xx = w_xx + (-alpha_m ** 2) * W * sm * sn
+                w_yy = w_yy + (-alpha_n ** 2) * W * sm * sn
+                w_xy = w_xy + (alpha_m * alpha_n) * W * cm * cn
+                n_terms += 1
+
+        out = {
+            'w': w, 'w_xx': w_xx, 'w_yy': w_yy, 'w_xy': w_xy,
+            # StrainNeuron konvansiyonu: κ_ij = -w_ij
+            'kappa_xx': -w_xx, 'kappa_yy': -w_yy, 'kappa_xy': -w_xy,
+            'w_max': w.abs().max(),
+            'r_max': r_max,
+            'buckled': r_max >= 1.0,
+        }
+
+        if explain:
+            self._explain_navier(label, q, N_x, N_y, mindlin, n_modes,
+                                 n_terms, D, out)
+        return out
+
+    def _explain_navier(self, label, q, N_x, N_y, mindlin, n_modes,
+                        n_terms, D, out):
+        """Navier çözümünü adım adım yazdır (şeffaf mod)."""
+        sep = "-" * 68
+        head = "  StaticNeuron — Navier serisi çözümü"
+        if label:
+            head += f" [{label}]"
+        print(f"{sep}\n{head}\n{sep}")
+        print(f"    Plaka: Lx = {self.Lx:.4g} m, Ly = {self.Ly:.4g} m, "
+              f"h = {self.material.h:.4g} m   |   D = {D:.6g} N·m")
+        print(f"    Uniform yük q = {q:.6g} Pa")
+        print(f"    Düzlem içi bası: N_x = {N_x/1e3:.4g} kN/m, "
+              f"N_y = {N_y/1e3:.4g} kN/m")
+        print(f"    Seri: m,n ≤ {n_modes} (tek modlar) → {n_terms} terim, "
+              f"türevler analitik (FFT yok)")
+        print(f"    w_mn = q_mn/[D(α_m²+α_n²)²],  q_mn = 16q/(π²mn)")
+        if mindlin:
+            print("    Mindlin kayma esnekliği çarpanı uygulandı")
+        amp1 = (1.0 / (1.0 - min(out['r_max'], 0.99)) if out['r_max'] < 1.0
+                else float('inf'))
+        print(f"    P-Δ: en büyük mod oranı r = N/N_cr,mn = {out['r_max']:.6f}"
+              f"  → büyütme ≈ {amp1:.4f}×")
+        print(f"    → w_max = {out['w_max'].item()*1e3:.6g} mm"
+              f"{'   [MOD BURKULDU — r ≥ 1]' if out['buckled'] else ''}")
+        print(sep)
+
     def navier_coefficients(self, q: torch.Tensor) -> torch.Tensor:
         """
         Yük alanından Navier katsayılarını hesapla.
-        
+
         qmn = (4/LW) ∫∫ q(x,y)·sin(mπx/L)·sin(nπy/W) dxdy
         """
         coeffs = []
@@ -1390,24 +1818,62 @@ class ThermalNeuron(nn.Module):
         NT = sigma * self.h
         return NT
     
-    def critical_thermal_buckling(self, m: int = 1, n: int = 1) -> float:
+    def critical_thermal_buckling(self, m: int = 1, n: int = 1,
+                                  loading: str = "biaxial",
+                                  direction: str = "x",
+                                  mindlin: bool = False,
+                                  explain: bool = False,
+                                  label: str = "") -> float:
+        r"""
+        Kritik termal burkulma sıcaklık farkı ΔT_cr.
+
+        |N_T(ΔT_cr)| = N_cr koşulundan:
+
+            E·α·ΔT_cr·h/(1-ν) = N_cr   →   ΔT_cr = N_cr(1-ν)/(E·α·h)
+
+        VARSAYILAN 'biaxial'dir ve bu bilinçli bir seçimdir: düzlem içinde
+        tam kısıtlı bir plaka ısındığında her iki yönde de genleşemez, yani
+        N_x = N_y = N_T oluşur. Kritik yükün uniaxial formülüyle hesaplanması
+        (bu metodun eski davranışı) kare plakada N_cr'yi — dolayısıyla
+        ΔT_cr'yi — 2 kat FAZLA, yani güvensiz yönde tahmin ediyordu.
+        Tek eksenli kısıtlama için açıkça loading='uniaxial' verilmelidir.
+
+        Args:
+            m, n: Burkulma mod numaraları.
+            loading: 'biaxial' (varsayılan, tam kısıtlı plaka) veya 'uniaxial'.
+            direction: uniaxial halde kısıtlama yönü ('x' veya 'y').
+            mindlin: Enine kayma düzeltmesi uygulansın mı.
+            explain: True ise adımlar sayısal değerleriyle yazdırılır.
+            label: explain çıktısı için etiket.
+
+        Returns:
+            ΔT_cr: Kritik sıcaklık farkı [K] (pozitif büyüklük).
         """
-        Kritik termal burkulma sıcaklık farkı.
-        
-        ΔT_cr = π²D / (α·E·h·L²·(1-ν)) · [(m)² + (n·L/W)²]²/m²
-        
-        Bu, N_cr'yi termal kuvvetle eşleştirir.
-        """
-        # Kritik mekanik yük
-        term_x = (m * math.pi / self.Lx) ** 2
-        term_y = (n * math.pi / self.Ly) ** 2
-        N_cr = self.D * ((term_x + term_y) ** 2) / term_x
-        
-        # Kritik sıcaklık farkı
-        # NT = N_cr → -Eα·ΔT·h/(1-ν) = N_cr
-        delta_T_cr = -N_cr * (1 - self.nu) / (self.E * self.alpha * self.h)
-        
-        return abs(delta_T_cr)
+        N_cr, N_cr_kirchhoff = plate_critical_load(
+            self.D, self.Lx, self.Ly, m=m, n=n,
+            loading=loading, direction=direction, mindlin=mindlin,
+            E=self.E, nu=self.nu, h=self.h)
+
+        # NT = N_cr → E·α·ΔT·h/(1-ν) = N_cr
+        delta_T_cr = abs(N_cr * (1 - self.nu) / (self.E * self.alpha * self.h))
+
+        if explain:
+            sep = "-" * 68
+            head = "  ThermalNeuron — kritik termal burkulma"
+            if label:
+                head += f" [{label}]"
+            kind = (f"tek eksenli ({direction})" if loading == "uniaxial"
+                    else "iki eksenli (tam kısıtlı plaka)")
+            print(f"{sep}\n{head}\n{sep}")
+            print(f"    Kısıtlama: {kind}   |   mod (m,n) = ({m},{n})")
+            print(f"    D = {self.D:.6g} N·m,  α = {self.alpha:.4g} 1/K,  "
+                  f"h = {self.h:.4g} m")
+            print(f"    N_cr = {N_cr:.6g} N/m"
+                  + (f"  (Mindlin öncesi {N_cr_kirchhoff:.6g})" if mindlin else ""))
+            print(f"    ΔT_cr = N_cr(1-ν)/(E·α·h) = {delta_T_cr:.6g} K")
+            print(sep)
+
+        return delta_T_cr
     
     def temperature_field(self, T_top: float, T_bottom: float) -> torch.Tensor:
         """
@@ -1442,16 +1908,124 @@ class ThermalNeuron(nn.Module):
         kappa = self.alpha * delta_T / self.h
         return kappa
     
-    def forward(self, delta_T: float) -> Dict[str, float]:
+    def critical_mode_scan(self, max_m: int = 6, max_n: int = 6,
+                           loading: str = "biaxial",
+                           direction: str = "x",
+                           mindlin: bool = False) -> Dict[str, float]:
         """
-        Termal analiz sonuçları.
+        (m,n) uzayını tarayıp en düşük kritik yükü veren termal burkulma
+        modunu bul. Dikdörtgen panelde kritik mod (1,1) olmayabilir.
+
+        Returns:
+            {'N_cr':…, 'm':…, 'n':…, 'delta_T_cr':…}
         """
-        return {
-            'eps_T': self.thermal_strain(delta_T),
-            'sigma_T': self.thermal_stress_constrained(delta_T),
-            'N_T': self.thermal_membrane_force(delta_T),
-            'delta_T_cr': self.critical_thermal_buckling()
+        best = None
+        for m in range(1, max_m + 1):
+            for n in range(1, max_n + 1):
+                N_cr, _ = plate_critical_load(
+                    self.D, self.Lx, self.Ly, m=m, n=n,
+                    loading=loading, direction=direction, mindlin=mindlin,
+                    E=self.E, nu=self.nu, h=self.h)
+                if best is None or N_cr < best['N_cr']:
+                    best = {'N_cr': N_cr, 'm': m, 'n': n}
+
+        best['delta_T_cr'] = abs(
+            best['N_cr'] * (1 - self.nu) / (self.E * self.alpha * self.h))
+        return best
+
+    def forward(self, delta_T: float,
+                loading: str = "biaxial",
+                direction: str = "x",
+                mindlin: bool = False,
+                max_mode: int = 6,
+                explain: bool = False,
+                label: str = "") -> Dict[str, float]:
+        r"""
+        Tam termal burkulma zinciri:
+
+            ΔT → ε_T = αΔT → σ_T = -EαΔT/(1-ν) → N_T = σ_T·h
+               → N_cr (mod taraması) → SF = N_cr/|N_T| , ΔT_cr
+
+        Args:
+            delta_T: Sıcaklık farkı [K].
+            loading, direction, mindlin: Kritik yük hesabının ayarları.
+            max_mode: Mod taramasının üst sınırı (m,n ≤ max_mode).
+            explain: True ise her adım sayısal değeriyle yazdırılır.
+            label: explain çıktısı için etiket.
+
+        Returns:
+            eps_T, sigma_T, N_T, N_cr, m, n, delta_T_cr, SF_thermal
+        """
+        eps_T = self.thermal_strain(delta_T)
+        sigma_T = self.thermal_stress_constrained(delta_T)
+        N_T = self.thermal_membrane_force(delta_T)
+        best = self.critical_mode_scan(max_mode, max_mode,
+                                       loading=loading, direction=direction,
+                                       mindlin=mindlin)
+        SF = (best['N_cr'] / abs(N_T)) if abs(N_T) > 0 else float('inf')
+
+        out = {
+            'eps_T': eps_T,
+            'sigma_T': sigma_T,
+            'N_T': N_T,
+            'N_cr': best['N_cr'],
+            'm': best['m'],
+            'n': best['n'],
+            'delta_T_cr': best['delta_T_cr'],
+            'SF_thermal': SF,
         }
+
+        if explain:
+            self._explain(label, delta_T, loading, direction, mindlin,
+                          max_mode, out)
+        return out
+
+    def _explain(self, label, delta_T, loading, direction, mindlin,
+                 max_mode, out):
+        """Termal burkulma zincirini adım adım yazdır (şeffaf mod)."""
+        sep = "=" * 68
+        title = " ThermalNeuron — Adım Adım Termal Burkulma "
+        if label:
+            title += f"[{label}] "
+        print(f"\n{sep}\n{title}\n{sep}")
+
+        kind = (f"tek eksenli ({direction})" if loading == "uniaxial"
+                else "iki eksenli (düzlem içi tam kısıtlı)")
+        print("[0] KURULUM")
+        print(f"    Panel: Lx = {self.Lx:.4g} m, Ly = {self.Ly:.4g} m, "
+              f"h = {self.h:.4g} m")
+        print(f"    E = {self.E:.4g} Pa, ν = {self.nu:.4g}, "
+              f"α = {self.alpha:.4g} 1/K")
+        print(f"    Sıcaklık farkı ΔT = {delta_T:.4g} K   |   kısıtlama: {kind}")
+        print(f"    D = E·h³/[12(1-ν²)] = {self.D:.6g} N·m")
+
+        print("[1] TERMAL GENLEŞME — serbest olsaydı")
+        print(f"    ε_T = α·ΔT = {out['eps_T']:.6g}"
+              f"   ({out['eps_T']*1e6:.4g} µstrain)")
+
+        print("[2] KISITLAMA — genleşme engellendiği için gerilme doğar")
+        isaret = ("bası" if out['sigma_T'] < 0 else
+                  "çeki" if out['sigma_T'] > 0 else "yok")
+        print(f"    σ_T = -E·α·ΔT/(1-ν) = {out['sigma_T']/1e6:.6g} MPa"
+              f"   ({isaret})")
+
+        print("[3] MEMBRAN KUVVETİ — kalınlık boyunca integral")
+        print(f"    N_T = σ_T·h = {out['N_T']/1e3:.6g} kN/m"
+              f"   (büyüklük {abs(out['N_T'])/1e3:.6g} kN/m)")
+
+        print(f"[4] KRİTİK YÜK — (m,n) taraması, m,n ≤ {max_mode}"
+              f"{', Mindlin düzeltmeli' if mindlin else ''}")
+        print(f"    N_cr = {out['N_cr']/1e3:.6g} kN/m"
+              f"   en kritik mod (m,n) = ({out['m']},{out['n']})")
+
+        print("[5] HÜKÜM")
+        sf = out['SF_thermal']
+        durum = ("BURKULDU" if sf < 1.0 else
+                 "SINIRDA" if sf < 1.5 else "GÜVENLİ")
+        print(f"    SF = N_cr/|N_T| = {sf:.4f}   → {durum}")
+        print(f"    ΔT_cr = {out['delta_T_cr']:.6g} K"
+              f"   (mevcut ΔT = {delta_T:.4g} K)")
+        print(sep)
     
     def extra_repr(self) -> str:
         return f"alpha={self.alpha:.2e}, E={self.E:.2e}"
